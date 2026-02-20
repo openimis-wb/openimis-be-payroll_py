@@ -56,6 +56,8 @@ class PaymentPointService(BaseService):
         return super().delete(obj_data)
 
 
+PAYROLL_BULK_CREATE_BATCH_SIZE = 500
+
 class PayrollService(BaseService):
     OBJECT_TYPE = Payroll
 
@@ -113,6 +115,17 @@ class PayrollService(BaseService):
     def attach_benefit_to_payroll(self, payroll_id, benefit_id):
         payroll_benefit = PayrollBenefitConsumption(payroll_id=payroll_id, benefit_id=benefit_id)
         payroll_benefit.save(user=self.user)
+
+    def bulk_attach_benefits(self, payroll_benefit_consumptions):
+        """Bulk create PayrollBenefitConsumption instances.
+
+        Args:
+            payroll_benefit_consumptions: list of PayrollBenefitConsumption model instances
+                                          with audit fields already set.
+        """
+        return PayrollBenefitConsumption.objects.bulk_create(
+            payroll_benefit_consumptions, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE
+        )
 
     @register_service_signal('payroll_service.create_task')
     def create_accept_payroll_task(self, payroll_id, obj_data):
@@ -282,6 +295,23 @@ class BenefitConsumptionService(BaseService):
         for bill in bills_queryset:
             benefit_attachment = BenefitAttachment(bill_id=bill.id, benefit_id=benefit_id)
             benefit_attachment.save(user=self.user)
+
+    def bulk_create(self, benefits):
+        """Bulk create BenefitConsumption instances.
+
+        Args:
+            benefits: list of BenefitConsumption model instances with pre-assigned PKs
+                      and audit fields already set.
+        """
+        return BenefitConsumption.objects.bulk_create(benefits, batch_size=500)
+
+    def bulk_create_attachments(self, attachments):
+        """Bulk create BenefitAttachment instances.
+
+        Args:
+            attachments: list of BenefitAttachment model instances with audit fields set.
+        """
+        return BenefitAttachment.objects.bulk_create(attachments, batch_size=500)
 
 
 class CsvReconciliationService:
