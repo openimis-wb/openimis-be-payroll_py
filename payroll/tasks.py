@@ -101,8 +101,9 @@ def create_payroll_benefits_task(payroll_id, user_id, obj_data):
             else:
                 payroll_service._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
                 
-            payroll.status = PayrollStatus.PENDING_APPROVAL
-            payroll.save(username=user.login_name)
+            if payroll.status != PayrollStatus.PENDING_APPROVAL:
+                payroll.status = PayrollStatus.PENDING_APPROVAL
+                payroll.save(username=user.login_name)
             payroll_service.create_accept_payroll_task(payroll.id, obj_data)
         finally:
             if OpenSearchDashboard:

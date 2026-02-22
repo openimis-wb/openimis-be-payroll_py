@@ -140,6 +140,7 @@ benefit_consumption_data_update = {
 }
 
 
+
 gql_benefit_consumption_query = """
 query q2 {
   benefitConsumption {
@@ -148,6 +149,15 @@ query q2 {
         id
       }
     }
+  }
+}
+"""
+
+
+gql_payroll_retrigger = """
+mutation retriggerPayroll($id: UUID!) {
+  retriggerPayroll(input: {id: $id}) {
+    clientMutationId
   }
 }
 """

@@ -99,7 +99,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         cls.json_ext_able_bodied_true = """{"advanced_criteria": [{"custom_filter_condition": "able_bodied__boolean=True"}]}"""
         cls.includedUnpaid = False
 
-    def setup(self):
+    def setUp(self):
         payroll = self.payroll_from_db()
         if payroll:
             self.delete_payroll_and_check_bill(payroll)

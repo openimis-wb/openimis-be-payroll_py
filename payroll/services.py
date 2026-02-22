@@ -1,3 +1,4 @@
+import json
 import logging
 import pandas as pd
 from io import BytesIO
@@ -9,14 +10,21 @@ from django.utils.translation import gettext as _
 
 from core import datetime
 from core.custom_filters import CustomFilterWizardStorage
+from core.utils import to_json_safe_value
 from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
+from core.services.utils import (
+    check_authentication as check_authentication,
+    output_exception,
+    model_representation,
+)
 from invoice.models import Bill, PaymentInvoice, DetailPaymentInvoice
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
 from payroll.models import (
+    PaymentPoint,
     Payroll,
     PayrollStatus,
     PayrollBenefitConsumption,
@@ -27,7 +35,6 @@ from payroll.models import (
 from payroll.tasks import send_requests_to_gateway_payment
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
-from core.services.utils import output_exception, check_authentication, model_representation
 from contribution_plan.models import PaymentPlan
 from social_protection.models import Beneficiary, BeneficiaryStatus
 from tasks_management.apps import TasksManagementConfig
@@ -70,15 +77,18 @@ class PayrollService(BaseService):
         try:
             with transaction.atomic():
                 obj_data = self._adjust_create_payload(obj_data)
+                
+                # Enrich json_ext with safe original params before saving
+                json_safe_obj_data = self._recursively_to_json_safe(obj_data)
+                obj_data['json_ext'] = {
+                    **self._get_json_ext_as_dict(obj_data),
+                    'creation_params': json_safe_obj_data
+                }
+
                 payroll, dict_representation = self._save_payroll(obj_data)
 
-                if payroll.json_ext is None:
-                    payroll.json_ext = {}
-                payroll.json_ext['creation_params'] = obj_data
-                payroll.save(username=self.user.login_name)
-
                 from payroll.tasks import create_payroll_benefits_task
-                create_payroll_benefits_task.delay(payroll.id, self.user.id, obj_data)
+                create_payroll_benefits_task.delay(payroll.id, self.user.id, json_safe_obj_data)
 
                 return dict_representation
         except Exception as exc:
@@ -182,12 +192,28 @@ class PayrollService(BaseService):
         payroll_id = obj_data['id']
         send_requests_to_gateway_payment.delay(payroll_id, self.user.id)
 
+    def _recursively_to_json_safe(self, obj):
+        if isinstance(obj, dict):
+            return {k: self._recursively_to_json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._recursively_to_json_safe(v) for v in obj]
+        return to_json_safe_value(obj)
+
     def _save_payroll(self, obj_data):
         obj_ = self.OBJECT_TYPE(**obj_data)
         dict_representation = self.save_instance(obj_)
         payroll_id = dict_representation["data"]["id"]
         payroll = Payroll.objects.get(id=payroll_id)
         return payroll, dict_representation
+
+    def _get_json_ext_as_dict(self, obj_data):
+        json_ext = obj_data.get("json_ext") or {}
+        if isinstance(json_ext, str):
+            try:
+                json_ext = json.loads(json_ext)
+            except (ValueError, TypeError):
+                json_ext = {}
+        return json_ext
 
     def _get_payment_plan(self, obj_data):
         payment_plan_id = obj_data.get("payment_plan_id")
@@ -205,8 +231,8 @@ class PayrollService(BaseService):
         return date_valid_from, date_valid_to
 
     def _select_beneficiary_based_on_criteria(self, obj_data, payment_plan):
-        json_ext = obj_data.get("json_ext", {})
-
+        json_ext = self._get_json_ext_as_dict(obj_data)
+        
         beneficiaries_queryset = Beneficiary.objects.filter(
             benefit_plan__id=payment_plan.benefit_plan.id,
             status=BeneficiaryStatus.ACTIVE,
