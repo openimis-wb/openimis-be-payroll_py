@@ -310,3 +310,30 @@ class DeleteBenefitConsumptionMutation(BaseHistoryModelDeleteMutationMixin, Base
 
     class Input(DeletePayrollInputType):
         pass
+
+
+class RetriggerPayrollMutation(BaseMutation):
+    _mutation_class = "RetriggerPayrollMutation"
+    _mutation_module = "payroll"
+    _model = Payroll
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        if type(user) is AnonymousUser or not user.has_perms(
+                PayrollConfig.gql_payroll_create_perms):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        service = PayrollService(user)
+        response = service.retrigger_creation(data)
+        return response
+
+    class Input(OpenIMISMutation.Input):
+        id = graphene.UUID(required=True)
+

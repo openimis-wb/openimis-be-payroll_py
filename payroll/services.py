@@ -17,8 +17,8 @@ from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
 from payroll.models import (
-    PaymentPoint,
     Payroll,
+    PayrollStatus,
     PayrollBenefitConsumption,
     BenefitConsumption,
     BenefitAttachment,
@@ -27,7 +27,7 @@ from payroll.models import (
 from payroll.tasks import send_requests_to_gateway_payment
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
-from core.services.utils import output_exception, check_authentication
+from core.services.utils import output_exception, check_authentication, model_representation
 from contribution_plan.models import PaymentPlan
 from social_protection.models import Beneficiary, BeneficiaryStatus
 from tasks_management.apps import TasksManagementConfig
@@ -70,24 +70,16 @@ class PayrollService(BaseService):
         try:
             with transaction.atomic():
                 obj_data = self._adjust_create_payload(obj_data)
-                from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
-                payment_plan = self._get_payment_plan(obj_data)
-                payment_cycle = self._get_payment_cycle(obj_data)
-                date_valid_from, date_valid_to = self._get_dates_parameter(obj_data)
                 payroll, dict_representation = self._save_payroll(obj_data)
-                if not bool(from_failed_invoices_payroll_id):
-                    beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
-                    self._generate_benefits(
-                        payment_plan,
-                        beneficiaries_queryset,
-                        date_valid_from,
-                        date_valid_to,
-                        payroll,
-                        payment_cycle
-                    )
-                else:
-                    self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
-                self.create_accept_payroll_task(payroll.id, obj_data)
+
+                if payroll.json_ext is None:
+                    payroll.json_ext = {}
+                payroll.json_ext['creation_params'] = obj_data
+                payroll.save(username=self.user.login_name)
+
+                from payroll.tasks import create_payroll_benefits_task
+                create_payroll_benefits_task.delay(payroll.id, self.user.id, obj_data)
+
                 return dict_representation
         except Exception as exc:
             return output_exception(model_name=self.OBJECT_TYPE.__name__, method="create", exception=exc)
@@ -109,6 +101,26 @@ class PayrollService(BaseService):
             'business_event': PayrollConfig.payroll_delete_event,
             'data': _get_std_task_data_payload(data)
         })
+
+    @check_authentication
+    @register_service_signal('payroll_service.retrigger_creation')
+    def retrigger_creation(self, obj_data):
+        try:
+            payroll = Payroll.objects.get(id=obj_data['id'])
+            creation_params = (payroll.json_ext or {}).get('creation_params')
+            if not creation_params:
+                raise ValueError("Original creation parameters not found.")
+
+            payroll.status = PayrollStatus.GENERATING
+            if payroll.json_ext:
+                payroll.json_ext.pop('creation_error', None)
+            payroll.save(username=self.user.login_name)
+
+            from payroll.tasks import create_payroll_benefits_task
+            create_payroll_benefits_task.delay(payroll.id, self.user.id, creation_params)
+            return model_representation(payroll)
+        except Exception as exc:
+            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="retrigger_creation", exception=exc)
 
     @check_authentication
     @register_service_signal('payroll_service.attach_benefit_to_payroll')

@@ -11,10 +11,12 @@ from individual.models import Individual
 
 
 class PayrollStatus(models.TextChoices):
+    GENERATING = "GENERATING", _("GENERATING")
     PENDING_APPROVAL = "PENDING_APPROVAL", _("PENDING_APPROVAL")
     APPROVE_FOR_PAYMENT = "APPROVE_FOR_PAYMENT", _("APPROVE_FOR_PAYMENT")
     REJECTED = "REJECTED", _("REJECTED")
     RECONCILED = "RECONCILED", _("RECONCILED")
+    FAILED = "FAILED", _("FAILED")
 
 
 class BenefitConsumptionStatus(models.TextChoices):
@@ -39,9 +41,11 @@ class Payroll(HistoryBusinessModel):
     payment_cycle = models.ForeignKey(PaymentCycle, on_delete=models.DO_NOTHING, blank=True, null=True)
     payment_point = models.ForeignKey(PaymentPoint, on_delete=models.DO_NOTHING, blank=True, null=True)
     status = models.CharField(
-        max_length=100, choices=PayrollStatus.choices, default=PayrollStatus.PENDING_APPROVAL, null=False
+        max_length=100, choices=PayrollStatus.choices, default=PayrollStatus.GENERATING, null=False
     )
     payment_method = models.CharField(max_length=255, blank=True, null=True)
+
+
 
     def __str__(self):
         return f"Payroll {self.name} - {self.uuid}"
