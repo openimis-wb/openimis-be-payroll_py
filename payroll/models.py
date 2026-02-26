@@ -66,7 +66,7 @@ class PaymentAdaptorHistory(HistoryModel):
 class BenefitConsumption(HistoryBusinessModel):
     individual = models.ForeignKey(Individual, on_delete=models.DO_NOTHING)
     photo = models.TextField(blank=True, null=True)
-    code = models.CharField(max_length=255, blank=False, null=False)
+    code = models.CharField(max_length=255, blank=True, default='')
     date_due = DateField(db_column='DateDue', null=True)
     receipt = models.CharField(db_column='Receipt', max_length=255, null=True, blank=True)
     amount = models.DecimalField(db_column='Amount', max_digits=18, decimal_places=2, null=True)
