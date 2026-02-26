@@ -87,8 +87,7 @@ class PayrollService(BaseService):
 
                 payroll, dict_representation = self._save_payroll(obj_data)
 
-                from payroll.tasks import create_payroll_benefits_task
-                create_payroll_benefits_task.delay(payroll.id, self.user.id, json_safe_obj_data)
+                self._create_payroll_benefits(payroll, json_safe_obj_data)
 
                 return dict_representation
         except Exception as exc:
@@ -126,8 +125,7 @@ class PayrollService(BaseService):
                 payroll.json_ext.pop('creation_error', None)
             payroll.save(username=self.user.login_name)
 
-            from payroll.tasks import create_payroll_benefits_task
-            create_payroll_benefits_task.delay(payroll.id, self.user.id, creation_params)
+            self._create_payroll_benefits(payroll, creation_params)
             return model_representation(payroll)
         except Exception as exc:
             return output_exception(model_name=self.OBJECT_TYPE.__name__, method="retrigger_creation", exception=exc)
@@ -291,6 +289,90 @@ class PayrollService(BaseService):
         benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
         benefits.update(status=BenefitConsumptionStatus.ACCEPTED)
 
+    def _create_payroll_benefits(self, payroll, obj_data):
+        try:
+            from opensearch_reports.models import OpenSearchDashboard
+        except ImportError:
+            OpenSearchDashboard = None
+
+        dashboards_to_toggle = ['Payment', 'Invoice']
+
+        try:
+            if OpenSearchDashboard:
+                OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=True)
+
+            try:
+                from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
+                payment_plan = self._get_payment_plan(obj_data)
+                payment_cycle = self._get_payment_cycle(obj_data)
+                date_valid_from, date_valid_to = self._get_dates_parameter(obj_data)
+
+                if not bool(from_failed_invoices_payroll_id):
+                    beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
+                    self._generate_benefits(
+                        payment_plan,
+                        beneficiaries_queryset,
+                        date_valid_from,
+                        date_valid_to,
+                        payroll,
+                        payment_cycle
+                    )
+                else:
+                    self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
+
+                if payroll.status != PayrollStatus.PENDING_APPROVAL:
+                    payroll.status = PayrollStatus.PENDING_APPROVAL
+                    payroll.save(username=self.user.login_name)
+                self.create_accept_payroll_task(payroll.id, obj_data)
+            finally:
+                if OpenSearchDashboard:
+                    OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=False)
+                    self._trigger_opensearch_reindex(payroll)
+
+        except Exception as exc:
+            logger.error(f"Error in _create_payroll_benefits for payroll {payroll.id}: {exc}", exc_info=exc)
+            try:
+                payroll.status = PayrollStatus.FAILED
+                if payroll.json_ext is None:
+                    payroll.json_ext = {}
+                payroll.json_ext['creation_error'] = str(exc)
+                payroll.save(username=self.user.login_name)
+            except Exception as e:
+                logger.error(f"Failed to update payroll status to FAILED: {e}")
+            raise
+
+    def _trigger_opensearch_reindex(self, payroll):
+        """Manually trigger OpenSearch indexing for all entities related to the payroll."""
+        try:
+            from django_opensearch_dsl.registries import registry
+        except ImportError:
+            return
+
+        try:
+            from invoice.models import BillItem
+            registry.update(payroll)
+
+            benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
+            if benefits.exists():
+                registry.update(benefits)
+
+            pbcs = PayrollBenefitConsumption.objects.filter(payroll=payroll)
+            if pbcs.exists():
+                registry.update(pbcs)
+
+            bills = Bill.objects.filter(benefitattachment__benefit__payrollbenefitconsumption__payroll=payroll).distinct()
+            if bills.exists():
+                registry.update(bills)
+                bill_items = BillItem.objects.filter(bill__in=bills)
+                if bill_items.exists():
+                    registry.update(bill_items)
+
+            attachments = BenefitAttachment.objects.filter(benefit__payrollbenefitconsumption__payroll=payroll)
+            if attachments.exists():
+                registry.update(attachments)
+
+        except Exception as e:
+            logger.warning(f"Failed to trigger OpenSearch re-indexing for payroll {payroll.id}: {e}")
 
 class BenefitConsumptionService(BaseService):
     OBJECT_TYPE = BenefitConsumption
