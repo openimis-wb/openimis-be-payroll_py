@@ -29,10 +29,25 @@ class Migration(migrations.Migration):
         ),
         migrations.RunSQL(
             sql="""
-            ALTER TABLE payroll_benefitconsumption
-            ALTER COLUMN code
-            SET DEFAULT 'BEN-' || to_char(now(), 'YY') || '-' || lpad(nextval('benefit_code_seq')::text, 7, '0');
+            CREATE OR REPLACE FUNCTION set_benefit_code()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                IF NEW.code IS NULL OR NEW.code = '' THEN
+                    NEW.code := 'BEN-' || to_char(now(), 'YY') || '-'
+                                || lpad(nextval('benefit_code_seq')::text, 10, '0');
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            DROP TRIGGER IF EXISTS benefit_code_trigger ON payroll_benefitconsumption;
+            CREATE TRIGGER benefit_code_trigger
+                BEFORE INSERT ON payroll_benefitconsumption
+                FOR EACH ROW EXECUTE FUNCTION set_benefit_code();
             """,
-            reverse_sql="ALTER TABLE payroll_benefitconsumption ALTER COLUMN code DROP DEFAULT;",
+            reverse_sql="""
+            DROP TRIGGER IF EXISTS benefit_code_trigger ON payroll_benefitconsumption;
+            DROP FUNCTION IF EXISTS set_benefit_code();
+            """,
         ),
     ]

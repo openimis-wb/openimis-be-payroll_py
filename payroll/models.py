@@ -75,6 +75,13 @@ class BenefitConsumption(HistoryBusinessModel):
         max_length=100, choices=BenefitConsumptionStatus.choices, default=BenefitConsumptionStatus.ACCEPTED, null=False
     )
 
+    def save(self, *args, **kwargs):
+        is_new = self._state.adding
+        result = super().save(*args, **kwargs)
+        if is_new:
+            self.refresh_from_db(fields=['code'])
+        return result
+
     def __str__(self):
         return f"Benefit Consumption {self.code} - {self.receipt} - {self.amount}"
 
