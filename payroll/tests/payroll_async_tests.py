@@ -55,7 +55,7 @@ class PayrollAsyncTests(PayrollGQLTestCase):
             "json_ext": self.json_ext_able_bodied_true,
         }
         
-        payroll = Payroll.objects.create(
+        payroll = Payroll(
             name=name,
             payment_cycle=self.payment_cycle,
             payment_plan=self.payment_plan,
@@ -69,6 +69,7 @@ class PayrollAsyncTests(PayrollGQLTestCase):
                 "creation_error": "Some old error"
             }
         )
+        payroll.save(username='username_authorized')
         
         variables = {"id": str(payroll.id)}
         output = self.gql_client.execute(
