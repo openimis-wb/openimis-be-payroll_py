@@ -45,8 +45,6 @@ class Payroll(HistoryBusinessModel):
     )
     payment_method = models.CharField(max_length=255, blank=True, null=True)
 
-
-
     def __str__(self):
         return f"Payroll {self.name} - {self.uuid}"
 
@@ -80,6 +78,10 @@ class BenefitConsumption(HistoryBusinessModel):
         result = super().save(*args, **kwargs)
         if is_new:
             self.refresh_from_db(fields=['code'])
+            # Patch history record with DB-assigned code.
+            latest = self.history.filter(history_type='+').order_by('-history_date').values('history_id').first()
+            if latest:
+                self.history.model.objects.filter(history_id=latest['history_id']).update(code=self.code)
         return result
 
     def __str__(self):

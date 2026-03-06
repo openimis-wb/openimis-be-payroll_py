@@ -6,9 +6,6 @@ from payroll.models import (
     Payroll,
     PayrollStatus,
     BenefitConsumptionStatus,
-    BenefitConsumption,
-    PayrollBenefitConsumption,
-    BenefitAttachment
 )
 from payroll.strategies import StrategyOnlinePayment
 from payroll.payments_registry import PaymentMethodStorage
