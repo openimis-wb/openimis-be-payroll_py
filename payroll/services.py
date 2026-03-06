@@ -15,11 +15,11 @@ from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
 from core.services.utils import (
-    check_authentication as check_authentication,
+    check_authentication,
     output_exception,
     model_representation,
 )
-from invoice.models import Bill, PaymentInvoice, DetailPaymentInvoice
+from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
 from payroll.apps import PayrollConfig
@@ -75,21 +75,21 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.create')
     def create(self, obj_data):
         try:
-            with transaction.atomic():
-                obj_data = self._adjust_create_payload(obj_data)
-                
-                # Enrich json_ext with safe original params before saving
-                json_safe_obj_data = self._recursively_to_json_safe(obj_data)
-                obj_data['json_ext'] = {
-                    **self._get_json_ext_as_dict(obj_data),
-                    'creation_params': json_safe_obj_data
-                }
+            obj_data = self._adjust_create_payload(obj_data)
 
+            json_safe_obj_data = self._recursively_to_json_safe(obj_data)
+            obj_data['json_ext'] = {
+                **self._get_json_ext_as_dict(obj_data),
+                'creation_params': json_safe_obj_data
+            }
+
+            # Commit independently so the row persists even if benefit generation fails.
+            with transaction.atomic():
                 payroll, dict_representation = self._save_payroll(obj_data)
 
-                self._create_payroll_benefits(payroll, json_safe_obj_data)
+            self._create_payroll_benefits(payroll, json_safe_obj_data)
 
-                return dict_representation
+            return dict_representation
         except Exception as exc:
             return output_exception(model_name=self.OBJECT_TYPE.__name__, method="create", exception=exc)
 
@@ -126,6 +126,7 @@ class PayrollService(BaseService):
             payroll.save(username=self.user.login_name)
 
             self._create_payroll_benefits(payroll, creation_params)
+            payroll.refresh_from_db()
             return model_representation(payroll)
         except Exception as exc:
             return output_exception(model_name=self.OBJECT_TYPE.__name__, method="retrigger_creation", exception=exc)
@@ -137,12 +138,6 @@ class PayrollService(BaseService):
         payroll_benefit.save(user=self.user)
 
     def bulk_attach_benefits(self, payroll_benefit_consumptions):
-        """Bulk create PayrollBenefitConsumption instances.
-
-        Args:
-            payroll_benefit_consumptions: list of PayrollBenefitConsumption model instances
-                                          with audit fields already set.
-        """
         return PayrollBenefitConsumption.objects.bulk_create(
             payroll_benefit_consumptions, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE
         )
@@ -210,6 +205,7 @@ class PayrollService(BaseService):
             try:
                 json_ext = json.loads(json_ext)
             except (ValueError, TypeError):
+                logger.warning(f"Could not parse json_ext as JSON; treating as empty: {json_ext!r}", exc_info=True)
                 json_ext = {}
         return json_ext
 
@@ -290,6 +286,8 @@ class PayrollService(BaseService):
         benefits.update(status=BenefitConsumptionStatus.ACCEPTED)
 
     def _create_payroll_benefits(self, payroll, obj_data):
+        obj_data = dict(obj_data)  # shallow copy — don't mutate caller's dict
+
         try:
             from opensearch_reports.models import OpenSearchDashboard
         except ImportError:
@@ -324,55 +322,58 @@ class PayrollService(BaseService):
                     payroll.status = PayrollStatus.PENDING_APPROVAL
                     payroll.save(username=self.user.login_name)
                 self.create_accept_payroll_task(payroll.id, obj_data)
+
+                if OpenSearchDashboard:
+                    self._trigger_opensearch_reindex(payroll)
             finally:
                 if OpenSearchDashboard:
-                    OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=False)
-                    self._trigger_opensearch_reindex(payroll)
+                    try:
+                        OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=False)
+                    except Exception as e:
+                        # Do NOT re-raise — must never mark a successful payroll as FAILED.
+                        logger.error(
+                            f"Failed to re-enable OpenSearch sync for payroll {payroll.id}: {e}",
+                            exc_info=True,
+                        )
 
         except Exception as exc:
-            logger.error(f"Error in _create_payroll_benefits for payroll {payroll.id}: {exc}", exc_info=exc)
+            logger.error(f"Error in _create_payroll_benefits for payroll {payroll.id}: {exc}", exc_info=True)
             try:
                 payroll.status = PayrollStatus.FAILED
                 if payroll.json_ext is None:
                     payroll.json_ext = {}
                 payroll.json_ext['creation_error'] = str(exc)
+                payroll.json_ext.pop('progress', None)
                 payroll.save(username=self.user.login_name)
             except Exception as e:
-                logger.error(f"Failed to update payroll status to FAILED: {e}")
+                logger.error(f"Failed to update payroll {payroll.id} status to FAILED: {e}", exc_info=True)
             raise
 
     def _trigger_opensearch_reindex(self, payroll):
-        """Manually trigger OpenSearch indexing for all entities related to the payroll."""
+        """Trigger OpenSearch indexing for payroll-related entities."""
         try:
             from django_opensearch_dsl.registries import registry
         except ImportError:
             return
 
         try:
-            from invoice.models import BillItem
             registry.update(payroll)
 
             benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
-            if benefits.exists():
-                registry.update(benefits)
+            registry.update(benefits)
 
             pbcs = PayrollBenefitConsumption.objects.filter(payroll=payroll)
-            if pbcs.exists():
-                registry.update(pbcs)
+            registry.update(pbcs)
 
             bills = Bill.objects.filter(benefitattachment__benefit__payrollbenefitconsumption__payroll=payroll).distinct()
-            if bills.exists():
-                registry.update(bills)
-                bill_items = BillItem.objects.filter(bill__in=bills)
-                if bill_items.exists():
-                    registry.update(bill_items)
+            registry.update(bills)
+            registry.update(BillItem.objects.filter(bill__in=bills))
 
             attachments = BenefitAttachment.objects.filter(benefit__payrollbenefitconsumption__payroll=payroll)
-            if attachments.exists():
-                registry.update(attachments)
+            registry.update(attachments)
 
         except Exception as e:
-            logger.warning(f"Failed to trigger OpenSearch re-indexing for payroll {payroll.id}: {e}")
+            logger.error(f"Failed to trigger OpenSearch re-indexing for payroll {payroll.id}: {e}", exc_info=True)
 
 class BenefitConsumptionService(BaseService):
     OBJECT_TYPE = BenefitConsumption
@@ -416,21 +417,10 @@ class BenefitConsumptionService(BaseService):
             benefit_attachment.save(user=self.user)
 
     def bulk_create(self, benefits):
-        """Bulk create BenefitConsumption instances.
-
-        Args:
-            benefits: list of BenefitConsumption model instances with pre-assigned PKs
-                      and audit fields already set.
-        """
-        return BenefitConsumption.objects.bulk_create(benefits, batch_size=500)
+        return BenefitConsumption.objects.bulk_create(benefits, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
 
     def bulk_create_attachments(self, attachments):
-        """Bulk create BenefitAttachment instances.
-
-        Args:
-            attachments: list of BenefitAttachment model instances with audit fields set.
-        """
-        return BenefitAttachment.objects.bulk_create(attachments, batch_size=500)
+        return BenefitAttachment.objects.bulk_create(attachments, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
 
 
 class CsvReconciliationService:
@@ -553,6 +543,7 @@ class CsvReconciliationService:
         bc = BenefitConsumption.objects.filter(code=row['code'], is_deleted=False).first()
         if not bc:
             errors.append(_('benefit_consumption_not_found'))
+            return errors
         if not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
             errors.append(_('benefit_consumption_not_in_payroll'))
         if (row[PayrollConfig.csv_reconciliation_paid_extra_field]

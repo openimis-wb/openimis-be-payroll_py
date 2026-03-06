@@ -327,10 +327,8 @@ class RetriggerPayrollMutation(BaseMutation):
 
     @classmethod
     def _mutate(cls, user, **data):
-        if "client_mutation_id" in data:
-            data.pop('client_mutation_id')
-        if "client_mutation_label" in data:
-            data.pop('client_mutation_label')
+        data.pop('client_mutation_id', None)
+        data.pop('client_mutation_label', None)
 
         service = PayrollService(user)
         response = service.retrigger_creation(data)
