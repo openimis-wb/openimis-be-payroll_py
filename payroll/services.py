@@ -32,7 +32,7 @@ from payroll.models import (
     BenefitAttachment,
     BenefitConsumptionStatus
 )
-from payroll.tasks import send_requests_to_gateway_payment
+from payroll.tasks import send_requests_to_gateway_payment, create_payroll_benefits_task
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
 from contribution_plan.models import PaymentPlan
@@ -87,7 +87,9 @@ class PayrollService(BaseService):
             with transaction.atomic():
                 payroll, dict_representation = self._save_payroll(obj_data)
 
-            self._create_payroll_benefits(payroll, json_safe_obj_data)
+            create_payroll_benefits_task.delay(
+                str(payroll.id), self.user.id, dict(json_safe_obj_data)
+            )
 
             return dict_representation
         except Exception as exc:
@@ -125,7 +127,9 @@ class PayrollService(BaseService):
                 payroll.json_ext.pop('creation_error', None)
             payroll.save(username=self.user.login_name)
 
-            self._create_payroll_benefits(payroll, creation_params)
+            create_payroll_benefits_task.delay(
+                str(payroll.id), self.user.id, dict(creation_params)
+            )
             payroll.refresh_from_db()
             return model_representation(payroll)
         except Exception as exc:
