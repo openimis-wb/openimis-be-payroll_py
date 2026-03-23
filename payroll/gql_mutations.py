@@ -45,7 +45,7 @@ class CreatePayrollInput(OpenIMISMutation.Input):
     payment_plan_id = graphene.UUID(required=True)
     payment_point_id = graphene.UUID(required=False)
     payment_cycle_id = graphene.UUID(required=False)
-    status = graphene.Field(PayrollStatusEnum, required=True)
+    status = graphene.Field(PayrollStatusEnum, required=False)
     payment_method = graphene.String(required=True, max_length=255)
     from_failed_invoices_payroll_id = graphene.UUID(required=False)
 
@@ -332,7 +332,9 @@ class RetriggerPayrollMutation(BaseMutation):
 
         service = PayrollService(user)
         response = service.retrigger_creation(data)
-        return response
+        if not response.get('success', True):
+            return response
+        return None
 
     class Input(OpenIMISMutation.Input):
         id = graphene.UUID(required=True)

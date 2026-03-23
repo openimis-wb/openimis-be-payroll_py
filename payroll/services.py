@@ -77,6 +77,8 @@ class PayrollService(BaseService):
         try:
             obj_data = self._adjust_create_payload(obj_data)
 
+            obj_data['status'] = PayrollStatus.GENERATING
+
             json_safe_obj_data = self._recursively_to_json_safe(obj_data)
             obj_data['json_ext'] = {
                 **self._get_json_ext_as_dict(obj_data),
@@ -120,7 +122,7 @@ class PayrollService(BaseService):
             payroll = Payroll.objects.get(id=obj_data['id'])
             creation_params = (payroll.json_ext or {}).get('creation_params')
             if not creation_params:
-                raise ValueError("Original creation parameters not found.")
+                raise ValueError(_("payroll.retrigger.creation_params_not_found"))
 
             payroll.status = PayrollStatus.GENERATING
             if payroll.json_ext:
@@ -230,7 +232,7 @@ class PayrollService(BaseService):
 
     def _select_beneficiary_based_on_criteria(self, obj_data, payment_plan):
         json_ext = self._get_json_ext_as_dict(obj_data)
-        
+
         beneficiaries_queryset = Beneficiary.objects.filter(
             benefit_plan__id=payment_plan.benefit_plan.id,
             status=BeneficiaryStatus.ACTIVE,
@@ -289,6 +291,8 @@ class PayrollService(BaseService):
         benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
         benefits.update(status=BenefitConsumptionStatus.ACCEPTED)
 
+    _OPENSEARCH_SYNC_LOCK_ID = 0x4F53_5059
+
     def _create_payroll_benefits(self, payroll, obj_data):
         obj_data = dict(obj_data)  # shallow copy — don't mutate caller's dict
 
@@ -301,7 +305,7 @@ class PayrollService(BaseService):
 
         try:
             if OpenSearchDashboard:
-                OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=True)
+                self._disable_opensearch_sync(dashboards_to_toggle)
 
             try:
                 from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
@@ -331,14 +335,7 @@ class PayrollService(BaseService):
                     self._trigger_opensearch_reindex(payroll)
             finally:
                 if OpenSearchDashboard:
-                    try:
-                        OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=False)
-                    except Exception as e:
-                        # Do NOT re-raise — must never mark a successful payroll as FAILED.
-                        logger.error(
-                            f"Failed to re-enable OpenSearch sync for payroll {payroll.id}: {e}",
-                            exc_info=True,
-                        )
+                    self._reenable_opensearch_sync(dashboards_to_toggle, payroll.id)
 
         except Exception as exc:
             logger.error(f"Error in _create_payroll_benefits for payroll {payroll.id}: {exc}", exc_info=True)
@@ -352,6 +349,38 @@ class PayrollService(BaseService):
             except Exception as e:
                 logger.error(f"Failed to update payroll {payroll.id} status to FAILED: {e}", exc_info=True)
             raise
+
+    @staticmethod
+    def _disable_opensearch_sync(dashboards_to_toggle):
+        from opensearch_reports.models import OpenSearchDashboard
+        from django.db import connection
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_lock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
+        OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=True)
+
+    @staticmethod
+    def _reenable_opensearch_sync(dashboards_to_toggle, payroll_id):
+        from opensearch_reports.models import OpenSearchDashboard
+        from django.db import connection
+        try:
+            other_generating = Payroll.objects.filter(
+                status=PayrollStatus.GENERATING
+            ).exclude(id=payroll_id).exists()
+            if not other_generating:
+                OpenSearchDashboard.objects.filter(
+                    name__in=dashboards_to_toggle
+                ).update(synch_disabled=False)
+        except Exception as e:
+            logger.error(
+                f"Failed to re-enable OpenSearch sync for payroll {payroll_id}: {e}",
+                exc_info=True,
+            )
+        finally:
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT pg_advisory_unlock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
+            except Exception as e:
+                logger.error(f"Failed to release advisory lock: {e}", exc_info=True)
 
     def _trigger_opensearch_reindex(self, payroll):
         """Trigger OpenSearch indexing for payroll-related entities."""
