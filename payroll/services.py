@@ -309,10 +309,9 @@ class PayrollService(BaseService):
         dashboards_to_toggle = ['Payment', 'Invoice']
 
         try:
-            if OpenSearchDashboard:
-                self._disable_opensearch_sync(dashboards_to_toggle)
-
             try:
+                if OpenSearchDashboard:
+                    self._disable_opensearch_sync(dashboards_to_toggle)
                 from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
                 payment_plan = self._get_payment_plan(obj_data)
                 payment_cycle = self._get_payment_cycle(obj_data)
@@ -359,8 +358,9 @@ class PayrollService(BaseService):
     def _disable_opensearch_sync(dashboards_to_toggle):
         from opensearch_reports.models import OpenSearchDashboard
         from django.db import connection
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT pg_advisory_lock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
+        if connection.vendor == 'postgresql':
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_lock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
         OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=True)
 
     @staticmethod
@@ -381,11 +381,12 @@ class PayrollService(BaseService):
                 exc_info=True,
             )
         finally:
-            try:
-                with connection.cursor() as cursor:
-                    cursor.execute("SELECT pg_advisory_unlock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
-            except Exception as e:
-                logger.error(f"Failed to release advisory lock: {e}", exc_info=True)
+            if connection.vendor == 'postgresql':
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT pg_advisory_unlock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
+                except Exception as e:
+                    logger.error(f"Failed to release advisory lock: {e}", exc_info=True)
 
     def _trigger_opensearch_reindex(self, payroll):
         """Trigger OpenSearch indexing for payroll-related entities."""

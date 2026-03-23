@@ -89,8 +89,8 @@ query q2 {
 """
 
 gql_payroll_create = """
-mutation createPayroll($name: String!, $paymentCycleId: UUID, $paymentPlanId: UUID!, $paymentPointId: UUID, $paymentMethod: String!, $status: PayrollStatusEnum!, $dateValidFrom: Date, $dateValidTo: Date, $jsonExt: JSONString, $clientMutationId: String) {
-  createPayroll(input: {name: $name, paymentCycleId: $paymentCycleId, paymentPlanId: $paymentPlanId, paymentPointId: $paymentPointId, paymentMethod: $paymentMethod, status: $status, dateValidFrom: $dateValidFrom, dateValidTo: $dateValidTo, jsonExt: $jsonExt, clientMutationId : $clientMutationId}) {
+mutation createPayroll($name: String!, $paymentCycleId: UUID, $paymentPlanId: UUID!, $paymentPointId: UUID, $paymentMethod: String!, $dateValidFrom: Date, $dateValidTo: Date, $jsonExt: JSONString, $clientMutationId: String) {
+  createPayroll(input: {name: $name, paymentCycleId: $paymentCycleId, paymentPlanId: $paymentPlanId, paymentPointId: $paymentPointId, paymentMethod: $paymentMethod, dateValidFrom: $dateValidFrom, dateValidTo: $dateValidTo, jsonExt: $jsonExt, clientMutationId: $clientMutationId}) {
     clientMutationId
   }
 }
@@ -104,7 +104,6 @@ mutation m2 {
                 paymentPlanId: "%s"
                 paymentPointId: "%s"
                 paymentMethod: "%s"
-                status: %s
                 dateValidFrom: "%s"
                 dateValidTo: "%s"
   }) {
