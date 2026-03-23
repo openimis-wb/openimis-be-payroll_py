@@ -343,6 +343,12 @@ On first apply, the migration advances the sequence past the current maximum to 
 
 To reverse: `python manage.py migrate payroll 0023`
 
+### Maintainer note: MSSQL trigger column list
+
+The MSSQL `INSTEAD OF INSERT` trigger explicitly lists every column of `payroll_benefitconsumption` in its `INSERT ... SELECT` statement. This is intentional — an `AFTER INSERT` + `UPDATE` approach would double the write I/O for bulk inserts (critical for payroll generation with 100k+ rows).
+
+**When adding or removing columns on `BenefitConsumption`**, you must create a new migration that recreates the trigger with the updated column list. Failure to do so will cause inserts to fail or silently drop values for new columns on MSSQL.
+
 ## Payroll Bulk Creation and Lifecycle
 
 ### Payroll lifecycle
