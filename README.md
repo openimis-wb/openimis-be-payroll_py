@@ -356,7 +356,7 @@ The payroll row is committed **before** benefit generation begins so it persists
 
 ### Retriggering a failed payroll
 
-A `FAILED` payroll can be retriggered via the `retriggerPayrollCreation` GraphQL mutation or `PayrollService.retrigger_creation()`. It re-reads `creation_params` from `json_ext` and re-runs benefit generation.
+A `FAILED` payroll can be retriggered via the `retriggerPayroll` GraphQL mutation or `PayrollService.retrigger_creation()`. It re-reads `creation_params` from `json_ext` and re-runs benefit generation.
 
 ## Payment Flow for Offline Payroll Payments
 

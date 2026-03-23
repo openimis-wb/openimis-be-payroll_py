@@ -5,11 +5,13 @@ from payroll.services import PayrollService
 from payroll.tests.payroll_gql_tests import PayrollGQLTestCase
 from payroll.tests.data import gql_payroll_create, gql_payroll_retrigger
 
+
 @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
 class PayrollAsyncTests(PayrollGQLTestCase):
 
     def test_create_payroll_async_success(self):
-        """Verify that creating a payroll triggers the async task and completes successfully."""
+        """Verify that creating a payroll triggers the async task and transitions
+        from GENERATING to PENDING_APPROVAL on success."""
         name = "AsyncPayrollTest"
         Payroll.objects.filter(name=name).delete()
 
@@ -19,7 +21,6 @@ class PayrollAsyncTests(PayrollGQLTestCase):
             "paymentPlanId": str(self.payment_plan.id),
             "paymentPointId": str(self.payment_point.id),
             "paymentMethod": self.payment_method,
-            "status": "PENDING_APPROVAL",
             "dateValidFrom": self.date_valid_from,
             "dateValidTo": self.date_valid_to,
             "jsonExt": self.json_ext_able_bodied_true,
@@ -87,6 +88,8 @@ class PayrollAsyncTests(PayrollGQLTestCase):
         self.assertGreater(benefit_count, 0, "No benefits were created after retriggering")
 
     def test_create_payroll_persists_failed_status_on_bad_plan(self):
+        """Verify that when benefit generation fails, the payroll row persists
+        with FAILED status and creation_error/creation_params in json_ext."""
         name = "FailedCreationTest"
         Payroll.objects.filter(name=name).delete()
 
@@ -130,3 +133,28 @@ class PayrollAsyncTests(PayrollGQLTestCase):
         self.assertFalse(result.get("success", True), "Expected retrigger to return failure")
         payroll.refresh_from_db()
         self.assertEqual(payroll.status, PayrollStatus.FAILED, "Status must stay FAILED")
+
+    def test_retrigger_non_failed_payroll_returns_error(self):
+        """Verify retrigger_creation rejects payrolls that are not in FAILED status."""
+        name = "RetriggerNonFailedTest"
+        Payroll.objects.filter(name=name).delete()
+
+        payroll = Payroll(
+            name=name,
+            payment_plan=self.payment_plan,
+            payment_cycle=self.payment_cycle,
+            payment_point=self.payment_point,
+            payment_method=self.payment_method,
+            status=PayrollStatus.PENDING_APPROVAL,
+            date_valid_from=self.date_valid_from,
+            date_valid_to=self.date_valid_to,
+            json_ext={"creation_params": {"some": "params"}}
+        )
+        payroll.save(username='username_authorized')
+
+        service = PayrollService(self.user)
+        result = service.retrigger_creation({"id": payroll.id})
+
+        self.assertFalse(result.get("success", True), "Expected retrigger to be rejected for non-FAILED payroll")
+        payroll.refresh_from_db()
+        self.assertEqual(payroll.status, PayrollStatus.PENDING_APPROVAL, "Status must not change")
