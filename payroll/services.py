@@ -65,6 +65,7 @@ class PaymentPointService(BaseService):
 
 PAYROLL_BULK_CREATE_BATCH_SIZE = 500
 
+
 class PayrollService(BaseService):
     OBJECT_TYPE = Payroll
 
@@ -254,10 +255,10 @@ class PayrollService(BaseService):
         location_ids = filter_criteria.get("location_ids", [])
         if location_ids:
             beneficiaries_queryset = beneficiaries_queryset.filter(
-                Q(individual__location__uuid__in=location_ids) |
-                Q(individual__location__parent__uuid__in=location_ids) |
-                Q(individual__location__parent__parent__uuid__in=location_ids) |
-                Q(individual__location__parent__parent__parent__uuid__in=location_ids)
+                Q(individual__location__uuid__in=location_ids)
+                | Q(individual__location__parent__uuid__in=location_ids)
+                | Q(individual__location__parent__parent__uuid__in=location_ids)
+                | Q(individual__location__parent__parent__parent__uuid__in=location_ids)
             )
 
         custom_filters = [
@@ -412,6 +413,7 @@ class PayrollService(BaseService):
         except Exception as e:
             logger.error(f"Failed to trigger OpenSearch re-indexing for payroll {payroll.id}: {e}", exc_info=True)
 
+
 class BenefitConsumptionService(BaseService):
     OBJECT_TYPE = BenefitConsumption
 
@@ -454,6 +456,11 @@ class BenefitConsumptionService(BaseService):
             benefit_attachment.save(user=self.user)
 
     def bulk_create(self, benefits):
+        """Bulk-create BenefitConsumptions. Returns instances with DB-assigned codes.
+
+        Note: bulk_create() skips Model.save() and signals. Callers that need
+        history records should write them separately.
+        """
         created = BenefitConsumption.objects.bulk_create(benefits, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
         empty_code_ids = [b.id for b in created if not b.code]
         if empty_code_ids:

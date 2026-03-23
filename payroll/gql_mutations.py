@@ -8,7 +8,7 @@ from core.gql.gql_mutations.base_mutation import BaseHistoryModelCreateMutationM
     BaseHistoryModelUpdateMutationMixin, BaseHistoryModelDeleteMutationMixin
 from core.schema import OpenIMISMutation
 from payroll.apps import PayrollConfig
-from payroll.models import PaymentPoint, Payroll, PayrollStatus, PayrollMutation
+from payroll.models import PaymentPoint, Payroll, PayrollMutation
 from payroll.services import PaymentPointService, PayrollService, BenefitConsumptionService
 
 
@@ -330,4 +330,3 @@ class RetriggerPayrollMutation(BaseMutation):
 
     class Input(OpenIMISMutation.Input):
         id = graphene.UUID(required=True)
-

@@ -140,7 +140,6 @@ benefit_consumption_data_update = {
 }
 
 
-
 gql_benefit_consumption_query = """
 query q2 {
   benefitConsumption {

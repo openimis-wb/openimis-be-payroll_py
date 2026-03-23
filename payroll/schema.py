@@ -326,4 +326,3 @@ class Mutation(graphene.ObjectType):
     make_payment_for_payroll = MakePaymentForPayrollMutation.Field()
     delete_benefit_consumption = DeleteBenefitConsumptionMutation.Field()
     retrigger_payroll = RetriggerPayrollMutation.Field()
-
