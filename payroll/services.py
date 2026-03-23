@@ -454,7 +454,17 @@ class BenefitConsumptionService(BaseService):
             benefit_attachment.save(user=self.user)
 
     def bulk_create(self, benefits):
-        return BenefitConsumption.objects.bulk_create(benefits, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
+        created = BenefitConsumption.objects.bulk_create(benefits, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
+        empty_code_ids = [b.id for b in created if not b.code]
+        if empty_code_ids:
+            refreshed = {
+                b.id: b.code
+                for b in BenefitConsumption.objects.filter(id__in=empty_code_ids).only('id', 'code')
+            }
+            for b in created:
+                if b.id in refreshed:
+                    b.code = refreshed[b.id]
+        return created
 
     def bulk_create_attachments(self, attachments):
         return BenefitAttachment.objects.bulk_create(attachments, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
