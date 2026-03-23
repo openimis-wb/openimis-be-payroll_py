@@ -21,7 +21,7 @@ def create_payroll_benefits_task(payroll_id, user_id, obj_data):
         payroll = Payroll.objects.get(id=payroll_id)
         PayrollService(user)._create_payroll_benefits(payroll, dict(obj_data))
     except Exception as exc:
-        logger.error(f"Error in create_payroll_benefits_task for payroll {payroll_id}: {exc}", exc_info=exc)
+        logger.error(f"Error in create_payroll_benefits_task for payroll {payroll_id}: {exc}", exc_info=True)
         raise
 
 
