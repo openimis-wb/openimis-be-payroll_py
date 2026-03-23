@@ -23,8 +23,10 @@ from social_protection.models import BenefitPlan, Beneficiary, BeneficiaryStatus
 from social_protection.tests.data import service_add_payload
 from social_protection.tests.test_helpers import create_project
 from location.test_helpers import create_basic_test_locations
+from django.test import override_settings
 
 
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True)
 class PayrollGQLTestCase(openIMISGraphQLTestCase):
 
     user = None
