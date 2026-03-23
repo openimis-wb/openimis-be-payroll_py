@@ -123,7 +123,7 @@ class PayrollService(BaseService):
             payroll = Payroll.objects.get(id=obj_data['id'])
             if payroll.status != PayrollStatus.FAILED:
                 raise ValueError(
-                    _("payroll.retrigger.invalid_status") % {'status': payroll.status}
+                    f"{_('payroll.retrigger.invalid_status')}: {payroll.status}"
                 )
             creation_params = (payroll.json_ext or {}).get('creation_params')
             if not creation_params:
