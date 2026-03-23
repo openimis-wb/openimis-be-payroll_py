@@ -75,8 +75,9 @@ class BenefitConsumption(HistoryBusinessModel):
 
     def save(self, *args, **kwargs):
         is_new = self._state.adding
+        code_was_empty = not self.code
         result = super().save(*args, **kwargs)
-        if is_new:
+        if is_new and code_was_empty:
             self.refresh_from_db(fields=['code'])
             # Patch history record with DB-assigned code.
             latest = self.history.filter(history_type='+').order_by('-history_date').values('history_id').first()

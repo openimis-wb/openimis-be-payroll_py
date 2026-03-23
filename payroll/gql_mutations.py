@@ -33,19 +33,11 @@ class UpdatePaymentGatewayConfigInputType(OpenIMISMutation.Input):
 
 
 class CreatePayrollInput(OpenIMISMutation.Input):
-    class PayrollStatusEnum(graphene.Enum):
-        GENERATING = PayrollStatus.GENERATING
-        PENDING_APPROVAL = PayrollStatus.PENDING_APPROVAL
-        APPROVE_FOR_PAYMENT = PayrollStatus.APPROVE_FOR_PAYMENT
-        REJECTED = PayrollStatus.REJECTED
-        RECONCILED = PayrollStatus.RECONCILED
-        FAILED = PayrollStatus.FAILED
 
     name = graphene.String(required=True, max_length=255)
     payment_plan_id = graphene.UUID(required=True)
     payment_point_id = graphene.UUID(required=False)
     payment_cycle_id = graphene.UUID(required=False)
-    status = graphene.Field(PayrollStatusEnum, required=False)
     payment_method = graphene.String(required=True, max_length=255)
     from_failed_invoices_payroll_id = graphene.UUID(required=False)
 

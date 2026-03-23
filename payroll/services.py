@@ -120,6 +120,10 @@ class PayrollService(BaseService):
     def retrigger_creation(self, obj_data):
         try:
             payroll = Payroll.objects.get(id=obj_data['id'])
+            if payroll.status != PayrollStatus.FAILED:
+                raise ValueError(
+                    _("payroll.retrigger.invalid_status") % {'status': payroll.status}
+                )
             creation_params = (payroll.json_ext or {}).get('creation_params')
             if not creation_params:
                 raise ValueError(_("payroll.retrigger.creation_params_not_found"))
