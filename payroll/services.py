@@ -91,9 +91,16 @@ class PayrollService(BaseService):
             with transaction.atomic():
                 payroll, dict_representation = self._save_payroll(obj_data)
 
-            create_payroll_benefits_task.delay(
-                str(payroll.id), self.user.id, dict(json_safe_obj_data)
-            )
+            try:
+                create_payroll_benefits_task.delay(
+                    str(payroll.id), str(self.user.id), dict(json_safe_obj_data)
+                )
+            except Exception as task_exc:
+                logger.error(f"Failed to enqueue benefit generation task for payroll {payroll.id}: {task_exc}", exc_info=True)
+                payroll.status = PayrollStatus.FAILED
+                payroll.json_ext = {**(payroll.json_ext or {}), 'creation_error': str(task_exc)}
+                payroll.save(username=self.user.login_name)
+                raise
 
             return dict_representation
         except Exception as exc:
@@ -136,7 +143,7 @@ class PayrollService(BaseService):
             payroll.save(username=self.user.login_name)
 
             create_payroll_benefits_task.delay(
-                str(payroll.id), self.user.id, dict(creation_params)
+                str(payroll.id), str(self.user.id), dict(creation_params)
             )
             payroll.refresh_from_db()
             return model_representation(payroll)
@@ -151,7 +158,8 @@ class PayrollService(BaseService):
 
     def bulk_attach_benefits(self, payroll_benefit_consumptions):
         return bulk_create_with_history(
-            payroll_benefit_consumptions, PayrollBenefitConsumption, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE
+            payroll_benefit_consumptions, PayrollBenefitConsumption,
+            batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE, default_user=self.user,
         )
 
     @register_service_signal('payroll_service.create_task')
@@ -459,20 +467,43 @@ class BenefitConsumptionService(BaseService):
 
     def bulk_create(self, benefits):
         """Bulk-create BenefitConsumptions with history. Returns instances with DB-assigned codes."""
-        created = bulk_create_with_history(benefits, BenefitConsumption, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
-        empty_code_ids = [b.id for b in created if not b.code]
-        if empty_code_ids:
+        created = bulk_create_with_history(
+            benefits, BenefitConsumption,
+            batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE, default_user=self.user,
+        )
+        # Re-fetch codes assigned by DB trigger and patch history records.
+        # Chunked to stay under MSSQL's ~2100 parameter limit for IN clauses.
+        empty_code_benefits = [b for b in created if not b.code]
+        history_model = BenefitConsumption.history.model
+        for i in range(0, len(empty_code_benefits), PAYROLL_BULK_CREATE_BATCH_SIZE):
+            chunk = empty_code_benefits[i:i + PAYROLL_BULK_CREATE_BATCH_SIZE]
+            chunk_ids = [b.id for b in chunk]
             refreshed = {
                 b.id: b.code
-                for b in BenefitConsumption.objects.filter(id__in=empty_code_ids).only('id', 'code')
+                for b in BenefitConsumption.objects.filter(id__in=chunk_ids).only('id', 'code')
             }
-            for b in created:
+            for b in chunk:
                 if b.id in refreshed:
                     b.code = refreshed[b.id]
+            # Patch history creation records with DB-assigned codes.
+            history_records = list(history_model.objects.filter(
+                id__in=chunk_ids, history_type='+', code='',
+            ))
+            for h in history_records:
+                code = refreshed.get(h.id)
+                if code:
+                    h.code = code
+            if history_records:
+                history_model.objects.bulk_update(
+                    [h for h in history_records if h.code], ['code'],
+                )
         return created
 
     def bulk_create_attachments(self, attachments):
-        return bulk_create_with_history(attachments, BenefitAttachment, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
+        return bulk_create_with_history(
+            attachments, BenefitAttachment,
+            batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE, default_user=self.user,
+        )
 
 
 class CsvReconciliationService:
