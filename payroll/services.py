@@ -142,9 +142,16 @@ class PayrollService(BaseService):
                 payroll.json_ext.pop('creation_error', None)
             payroll.save(username=self.user.login_name)
 
-            create_payroll_benefits_task.delay(
-                str(payroll.id), str(self.user.id), dict(creation_params)
-            )
+            try:
+                create_payroll_benefits_task.delay(
+                    str(payroll.id), str(self.user.id), dict(creation_params)
+                )
+            except Exception as task_exc:
+                logger.error(f"Failed to enqueue retrigger task for payroll {payroll.id}: {task_exc}", exc_info=True)
+                payroll.status = PayrollStatus.FAILED
+                payroll.json_ext = {**(payroll.json_ext or {}), 'creation_error': str(task_exc)}
+                payroll.save(username=self.user.login_name)
+                raise
             payroll.refresh_from_db()
             return model_representation(payroll)
         except Exception as exc:
@@ -493,10 +500,9 @@ class BenefitConsumptionService(BaseService):
                 code = refreshed.get(h.id)
                 if code:
                     h.code = code
-            if history_records:
-                history_model.objects.bulk_update(
-                    [h for h in history_records if h.code], ['code'],
-                )
+            updated_history = [h for h in history_records if h.code]
+            if updated_history:
+                history_model.objects.bulk_update(updated_history, ['code'])
         return created
 
     def bulk_create_attachments(self, attachments):
