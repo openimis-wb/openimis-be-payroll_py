@@ -9,3 +9,9 @@ msgstr "Name %(name) already exists."
 
 msgid "payroll.validation.field_empty"
 msgstr "Field %(field) can not be empty."
+
+msgid "payroll.retrigger.invalid_status"
+msgstr "Cannot retrigger payroll creation unless status is FAILED"
+
+msgid "payroll.retrigger.creation_params_not_found"
+msgstr "Original creation parameters for this payroll could not be found."
