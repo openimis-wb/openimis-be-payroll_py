@@ -5,6 +5,7 @@ from io import BytesIO
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
+from simple_history.utils import bulk_create_with_history
 from django.db.models import Q
 from django.utils.translation import gettext as _
 
@@ -149,8 +150,8 @@ class PayrollService(BaseService):
         payroll_benefit.save(user=self.user)
 
     def bulk_attach_benefits(self, payroll_benefit_consumptions):
-        return PayrollBenefitConsumption.objects.bulk_create(
-            payroll_benefit_consumptions, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE
+        return bulk_create_with_history(
+            payroll_benefit_consumptions, PayrollBenefitConsumption, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE
         )
 
     @register_service_signal('payroll_service.create_task')
@@ -457,12 +458,8 @@ class BenefitConsumptionService(BaseService):
             benefit_attachment.save(user=self.user)
 
     def bulk_create(self, benefits):
-        """Bulk-create BenefitConsumptions. Returns instances with DB-assigned codes.
-
-        Note: bulk_create() skips Model.save() and signals. Callers that need
-        history records should write them separately.
-        """
-        created = BenefitConsumption.objects.bulk_create(benefits, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
+        """Bulk-create BenefitConsumptions with history. Returns instances with DB-assigned codes."""
+        created = bulk_create_with_history(benefits, BenefitConsumption, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
         empty_code_ids = [b.id for b in created if not b.code]
         if empty_code_ids:
             refreshed = {
@@ -475,7 +472,7 @@ class BenefitConsumptionService(BaseService):
         return created
 
     def bulk_create_attachments(self, attachments):
-        return BenefitAttachment.objects.bulk_create(attachments, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
+        return bulk_create_with_history(attachments, BenefitAttachment, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
 
 
 class CsvReconciliationService:
