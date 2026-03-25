@@ -27,7 +27,14 @@ from payroll.payments_registry import PaymentMethodStorage
 from social_protection.models import BenefitPlan
 
 
+class PayrollSystemStatusType(graphene.ObjectType):
+    triggers_synced = graphene.Boolean()
+    message = graphene.String()
+
+
 class Query(graphene.ObjectType):
+    payroll_system_status = graphene.Field(PayrollSystemStatusType)
+
     payment_point = OrderedDjangoFilterConnectionField(
         PaymentPointGQLType,
         orderBy=graphene.List(of_type=graphene.String),
@@ -169,6 +176,19 @@ class Query(graphene.ObjectType):
             filters.append(Q(mutations__mutation__client_mutation_id=client_mutation_id))
 
         return gql_optimizer.query(BenefitAttachment.objects.filter(*filters), info)
+
+    def resolve_payroll_system_status(self, info, **kwargs):
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        from invoice.apps import InvoiceConfig
+        synced = InvoiceConfig.bill_trigger_synced and PayrollConfig.benefit_trigger_synced
+        message = None
+        if not synced:
+            user = info.context.user
+            if hasattr(user, 'is_superuser') and user.is_superuser:
+                message = _("payroll.create.triggers_not_synced.admin")
+            else:
+                message = _("payroll.create.triggers_not_synced")
+        return PayrollSystemStatusType(triggers_synced=synced, message=message)
 
     def resolve_payment_point(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payment_point_search_perms)

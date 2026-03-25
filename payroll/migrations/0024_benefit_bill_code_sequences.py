@@ -45,12 +45,10 @@ def _pg_reverse(schema_editor):
 # ── MSSQL (SQL Server 2012+) ──────────────────────────────────────────────────
 
 def _mssql_apply(schema_editor):
-    # 1. Create sequence (idempotent)
     schema_editor.execute("""
         IF NOT EXISTS (SELECT 1 FROM sys.sequences WHERE object_id = OBJECT_ID('benefit_code_seq'))
             EXEC('CREATE SEQUENCE benefit_code_seq AS BIGINT START WITH 1 INCREMENT BY 1');
     """)
-    # 2. Advance sequence past the highest code already in the table
     schema_editor.execute("""
         DECLARE @max_val BIGINT = 0;
         SELECT @max_val = COALESCE(MAX(
@@ -67,14 +65,10 @@ def _mssql_apply(schema_editor):
         IF @max_val > 0
             EXEC(N'ALTER SEQUENCE benefit_code_seq RESTART WITH ' + CAST(@max_val + 1 AS NVARCHAR(20)));
     """)
-    # 3. Drop old trigger if present (must precede CREATE TRIGGER)
     schema_editor.execute("""
         IF OBJECT_ID('benefit_code_trigger', 'TR') IS NOT NULL
             DROP TRIGGER [benefit_code_trigger];
     """)
-    # 4. Create trigger — must be first statement in its batch.
-    # INSTEAD OF INSERT intercepts the row before it lands on disk so we can
-    # substitute a generated code inline, avoiding a redundant post-INSERT UPDATE.
     schema_editor.execute("""
         CREATE TRIGGER [benefit_code_trigger]
         ON [payroll_benefitconsumption]
@@ -86,10 +80,11 @@ def _mssql_apply(schema_editor):
                 [UUID], [code], [individual_id], [photo],
                 [DateDue], [Receipt], [Amount], [Type],
                 [status],
-                [date_valid_from], [date_valid_to],
-                [date_created], [date_updated],
-                [user_created_id], [user_updated_id],
-                [version], [is_deleted], [json_ext]
+                [DateValidFrom], [DateValidTo],
+                [ReplacementUUID],
+                [DateCreated], [DateUpdated],
+                [UserCreatedUUID], [UserUpdatedUUID],
+                [version], [isDeleted], [Json_ext]
             )
             SELECT
                 i.[UUID],
@@ -106,15 +101,16 @@ def _mssql_apply(schema_editor):
                 i.[Amount],
                 i.[Type],
                 i.[status],
-                i.[date_valid_from],
-                i.[date_valid_to],
-                i.[date_created],
-                i.[date_updated],
-                i.[user_created_id],
-                i.[user_updated_id],
+                i.[DateValidFrom],
+                i.[DateValidTo],
+                i.[ReplacementUUID],
+                i.[DateCreated],
+                i.[DateUpdated],
+                i.[UserCreatedUUID],
+                i.[UserUpdatedUUID],
                 i.[version],
-                i.[is_deleted],
-                i.[json_ext]
+                i.[isDeleted],
+                i.[Json_ext]
             FROM inserted i;
         END
     """)

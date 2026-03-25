@@ -77,6 +77,7 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.create')
     def create(self, obj_data):
         try:
+            self._check_triggers_synced()
             obj_data = self._adjust_create_payload(obj_data)
 
             obj_data['status'] = PayrollStatus.GENERATING
@@ -91,16 +92,7 @@ class PayrollService(BaseService):
             with transaction.atomic():
                 payroll, dict_representation = self._save_payroll(obj_data)
 
-            try:
-                create_payroll_benefits_task.delay(
-                    str(payroll.id), str(self.user.id), dict(json_safe_obj_data)
-                )
-            except Exception as task_exc:
-                logger.error(f"Failed to enqueue benefit generation task for payroll {payroll.id}: {task_exc}", exc_info=True)
-                payroll.status = PayrollStatus.FAILED
-                payroll.json_ext = {**(payroll.json_ext or {}), 'creation_error': str(task_exc)}
-                payroll.save(username=self.user.login_name)
-                raise
+            self._enqueue_benefit_generation(payroll, json_safe_obj_data)
 
             return dict_representation
         except Exception as exc:
@@ -128,6 +120,7 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.retrigger_creation')
     def retrigger_creation(self, obj_data):
         try:
+            self._check_triggers_synced()
             payroll = Payroll.objects.get(id=obj_data['id'])
             if payroll.status != PayrollStatus.FAILED:
                 raise ValueError(
@@ -137,22 +130,15 @@ class PayrollService(BaseService):
             if not creation_params:
                 raise ValueError(_("payroll.retrigger.creation_params_not_found"))
 
+            # Clean up partial data from the failed attempt before retrying
+            self._cleanup_payroll_benefits(payroll)
+
             payroll.status = PayrollStatus.GENERATING
             if payroll.json_ext:
                 payroll.json_ext.pop('creation_error', None)
             payroll.save(username=self.user.login_name)
 
-            try:
-                create_payroll_benefits_task.delay(
-                    str(payroll.id), str(self.user.id), dict(creation_params)
-                )
-            except Exception as task_exc:
-                logger.error(f"Failed to enqueue retrigger task for payroll {payroll.id}: {task_exc}", exc_info=True)
-                payroll.status = PayrollStatus.FAILED
-                payroll.json_ext = {**(payroll.json_ext or {}), 'creation_error': str(task_exc)}
-                payroll.save(username=self.user.login_name)
-                raise
-            payroll.refresh_from_db()
+            self._enqueue_benefit_generation(payroll, creation_params)
             return model_representation(payroll)
         except Exception as exc:
             return output_exception(model_name=self.OBJECT_TYPE.__name__, method="retrigger_creation", exception=exc)
@@ -210,7 +196,28 @@ class PayrollService(BaseService):
 
     def make_payment_for_payroll(self, obj_data):
         payroll_id = obj_data['id']
-        send_requests_to_gateway_payment.delay(payroll_id, self.user.id)
+        send_requests_to_gateway_payment.delay(str(payroll_id), str(self.user.id))
+
+    def _enqueue_benefit_generation(self, payroll, obj_data):
+        """Dispatch Celery task for benefit generation. Marks payroll FAILED on enqueue failure."""
+        try:
+            create_payroll_benefits_task.delay(
+                str(payroll.id), str(self.user.id), dict(obj_data)
+            )
+        except Exception as task_exc:
+            logger.error(f"Failed to enqueue benefit generation for payroll {payroll.id}: {task_exc}", exc_info=True)
+            payroll.status = PayrollStatus.FAILED
+            payroll.json_ext = {**(payroll.json_ext or {}), 'creation_error': str(task_exc)}
+            payroll.save(username=self.user.login_name)
+            raise
+
+    def _check_triggers_synced(self):
+        from invoice.apps import InvoiceConfig
+        from payroll.apps import PayrollConfig
+        if not InvoiceConfig.bill_trigger_synced or not PayrollConfig.benefit_trigger_synced:
+            if self.user and hasattr(self.user, 'is_superuser') and self.user.is_superuser:
+                raise ValueError(_("payroll.create.triggers_not_synced.admin"))
+            raise ValueError(_("payroll.create.triggers_not_synced"))
 
     def _recursively_to_json_safe(self, obj):
         if isinstance(obj, dict):
@@ -218,6 +225,29 @@ class PayrollService(BaseService):
         if isinstance(obj, (list, tuple, set)):
             return [self._recursively_to_json_safe(v) for v in obj]
         return to_json_safe_value(obj)
+
+    @transaction.atomic
+    def _cleanup_payroll_benefits(self, payroll):
+        """Remove all benefits/bills from a failed payroll before retrying."""
+        pbc_qs = PayrollBenefitConsumption.objects.filter(payroll=payroll)
+        benefit_ids = list(pbc_qs.values_list('benefit_id', flat=True))
+        if not benefit_ids:
+            return
+        bill_ids = list(
+            BenefitAttachment.objects.filter(
+                benefit_id__in=benefit_ids
+            ).values_list('bill_id', flat=True)
+        )
+        BenefitAttachment.objects.filter(benefit_id__in=benefit_ids).delete()
+        pbc_qs.delete()
+        BenefitConsumption.objects.filter(id__in=benefit_ids).delete()
+        if bill_ids:
+            BillItem.objects.filter(bill_id__in=bill_ids).delete()
+            Bill.objects.filter(id__in=bill_ids).delete()
+        logger.info(
+            f"Cleaned up {len(benefit_ids)} benefits and {len(bill_ids)} bills "
+            f"from failed payroll {payroll.id}"
+        )
 
     def _save_payroll(self, obj_data):
         obj_ = self.OBJECT_TYPE(**obj_data)
@@ -474,36 +504,12 @@ class BenefitConsumptionService(BaseService):
 
     def bulk_create(self, benefits):
         """Bulk-create BenefitConsumptions with history. Returns instances with DB-assigned codes."""
+        from invoice.trigger_sync import refresh_trigger_codes
         created = bulk_create_with_history(
             benefits, BenefitConsumption,
             batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE, default_user=self.user,
         )
-        # Re-fetch codes assigned by DB trigger and patch history records.
-        # Chunked to stay under MSSQL's ~2100 parameter limit for IN clauses.
-        empty_code_benefits = [b for b in created if not b.code]
-        history_model = BenefitConsumption.history.model
-        for i in range(0, len(empty_code_benefits), PAYROLL_BULK_CREATE_BATCH_SIZE):
-            chunk = empty_code_benefits[i:i + PAYROLL_BULK_CREATE_BATCH_SIZE]
-            chunk_ids = [b.id for b in chunk]
-            refreshed = {
-                b.id: b.code
-                for b in BenefitConsumption.objects.filter(id__in=chunk_ids).only('id', 'code')
-            }
-            for b in chunk:
-                if b.id in refreshed:
-                    b.code = refreshed[b.id]
-            # Patch history creation records with DB-assigned codes.
-            history_records = list(history_model.objects.filter(
-                id__in=chunk_ids, history_type='+', code='',
-            ))
-            for h in history_records:
-                code = refreshed.get(h.id)
-                if code:
-                    h.code = code
-            updated_history = [h for h in history_records if h.code]
-            if updated_history:
-                history_model.objects.bulk_update(updated_history, ['code'])
-        return created
+        return refresh_trigger_codes(created, BenefitConsumption, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
 
     def bulk_create_attachments(self, attachments):
         return bulk_create_with_history(
