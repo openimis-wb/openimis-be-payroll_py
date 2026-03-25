@@ -184,7 +184,7 @@ class PayrollConfig(AppConfig):
             logger.info(f"Benefit trigger updated after config change (pattern: {pattern})")
         except Exception as e:
             PayrollConfig.benefit_trigger_synced = False
-            logger.error(f"Failed to sync benefit trigger after config change: {e}")
+            logger.error(f"Failed to sync benefit trigger after config change: {e}", exc_info=True)
 
     @staticmethod
     def get_payroll_payment_file_path(payroll_id, file_name=None):
