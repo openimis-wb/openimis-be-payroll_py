@@ -9,7 +9,6 @@ from individual.models import Individual
 
 try:
     from invoice.trigger_sync import (
-        parse_pattern,
         pattern_to_pg_expr,
         pattern_to_mssql_expr,
         sync_trigger,

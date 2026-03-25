@@ -180,7 +180,7 @@ class Query(graphene.ObjectType):
     def resolve_payroll_system_status(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
         from invoice.apps import InvoiceConfig
-        synced = InvoiceConfig.bill_trigger_synced and PayrollConfig.benefit_trigger_synced
+        synced = getattr(InvoiceConfig, 'bill_trigger_synced', True) and PayrollConfig.benefit_trigger_synced
         message = None
         if not synced:
             user = info.context.user
