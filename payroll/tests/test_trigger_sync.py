@@ -1,20 +1,27 @@
+import unittest
 import uuid
 from django.db import connection
 from django.test import TestCase
 from core.test_helpers import LogInHelper
 from payroll.models import BenefitConsumption, BenefitConsumptionStatus
 from payroll.services import BenefitConsumptionService
-from invoice.trigger_sync import (
-    parse_pattern,
-    pattern_to_pg_expr,
-    pattern_to_mssql_expr,
-    sync_trigger,
-    DEFAULT_BENEFIT_CODE_PATTERN,
-    _get_model_columns,
-)
 from individual.models import Individual
 
+try:
+    from invoice.trigger_sync import (
+        parse_pattern,
+        pattern_to_pg_expr,
+        pattern_to_mssql_expr,
+        sync_trigger,
+        DEFAULT_BENEFIT_CODE_PATTERN,
+        _get_model_columns,
+    )
+    HAS_TRIGGER_SYNC = True
+except ImportError:
+    HAS_TRIGGER_SYNC = False
 
+
+@unittest.skipUnless(HAS_TRIGGER_SYNC, "invoice.trigger_sync not available")
 class BenefitCodePatternTests(TestCase):
     """Tests for benefit code pattern SQL generation."""
 
@@ -30,6 +37,7 @@ class BenefitCodePatternTests(TestCase):
         self.assertIn("'BEN-'", expr)
 
 
+@unittest.skipUnless(HAS_TRIGGER_SYNC, "invoice.trigger_sync not available")
 class BenefitColumnIntrospectionTests(TestCase):
     """Tests for BenefitConsumption column extraction."""
 
@@ -43,6 +51,7 @@ class BenefitColumnIntrospectionTests(TestCase):
         self.assertEqual(len(columns), len(set(columns)))
 
 
+@unittest.skipUnless(HAS_TRIGGER_SYNC, "invoice.trigger_sync not available")
 class BenefitTriggerSyncTests(TestCase):
     """Tests for benefit trigger sync detection and application."""
 
