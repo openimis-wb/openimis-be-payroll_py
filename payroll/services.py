@@ -217,7 +217,9 @@ class PayrollService(BaseService):
     def _check_triggers_synced(self):
         from invoice.apps import InvoiceConfig
         from payroll.apps import PayrollConfig
-        if not InvoiceConfig.bill_trigger_synced or not PayrollConfig.benefit_trigger_synced:
+        bill_synced = getattr(InvoiceConfig, 'bill_trigger_synced', True)
+        benefit_synced = getattr(PayrollConfig, 'benefit_trigger_synced', True)
+        if not bill_synced or not benefit_synced:
             if self.user and hasattr(self.user, 'is_superuser') and self.user.is_superuser:
                 raise ValueError(_("payroll.create.triggers_not_synced.admin"))
             raise ValueError(_("payroll.create.triggers_not_synced"))
