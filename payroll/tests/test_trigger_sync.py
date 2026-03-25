@@ -86,16 +86,16 @@ class BenefitTriggerSyncTests(TestCase):
 
         custom_pattern = 'PAY-[YYYY][MM]-[SEQ:6]'
 
-        sync_trigger(
-            model=BenefitConsumption,
-            sequence_name='benefit_code_seq',
-            trigger_name='benefit_code_trigger',
-            code_column='code',
-            pattern=custom_pattern,
-            pg_function_name='set_benefit_code',
-        )
-
+        bc = None
         try:
+            sync_trigger(
+                model=BenefitConsumption,
+                sequence_name='benefit_code_seq',
+                trigger_name='benefit_code_trigger',
+                code_column='code',
+                pattern=custom_pattern,
+                pg_function_name='set_benefit_code',
+            )
             bc = BenefitConsumption(
                 id=uuid.uuid4(),
                 individual=self.individual,
@@ -118,7 +118,8 @@ class BenefitTriggerSyncTests(TestCase):
                 pattern=DEFAULT_BENEFIT_CODE_PATTERN,
                 pg_function_name='set_benefit_code',
             )
-            BenefitConsumption.objects.filter(id=bc.id).delete()
+            if bc and bc.id:
+                BenefitConsumption.objects.filter(id=bc.id).delete()
 
     def test_sync_preserves_explicit_codes(self):
         if connection.vendor not in ('postgresql', 'microsoft'):
@@ -154,8 +155,8 @@ class BenefitTriggerSyncTests(TestCase):
         for bc in created:
             self.assertTrue(bc.code, "Code should be populated after bulk create")
             history = BenefitConsumption.history.filter(id=bc.id, history_type='+').first()
-            if history:
-                self.assertEqual(
-                    history.code, bc.code,
-                    f"History code {history.code!r} should match {bc.code!r}"
-                )
+            self.assertIsNotNone(history, f"Expected history record for BenefitConsumption {bc.id}")
+            self.assertEqual(
+                history.code, bc.code,
+                f"History code {history.code!r} should match {bc.code!r}"
+            )
