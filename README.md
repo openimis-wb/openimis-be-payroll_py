@@ -315,39 +315,42 @@ When the `payment_method` of a Payroll is set to `StrategyOnlinePayment`, the co
 
 ## BenefitConsumption Code Auto-Generation
 
-`BenefitConsumption.code` is auto-assigned by a database trigger and sequence (migration `0024_benefit_bill_code_sequences`). The trigger only fires when `code` is `NULL` or empty, so explicitly supplied codes are preserved.
+`BenefitConsumption.code` is auto-assigned by a database trigger and sequence when `code` is `NULL` or empty. Explicitly supplied codes are preserved.
 
-### Code format
+### Default format
 
 ```
 BEN-YY-XXXXXXXXXX
 ```
 
-- `YY` — two-digit year of insertion (e.g. `25` for 2025)
-- `XXXXXXXXXX` — zero-padded 10-digit monotonically increasing sequence number (e.g. `0000000001`)
+Example: `BEN-26-0000000001`
 
-Example: `BEN-25-0000000001`
+### Custom code patterns
 
-### How it works
+Configurable via `ModuleConfiguration`:
 
-| Database | Mechanism |
-|----------|-----------|
-| PostgreSQL | `BEFORE INSERT` trigger on `payroll_benefitconsumption`; calls `nextval('benefit_code_seq')` |
-| MSSQL | `INSTEAD OF INSERT` trigger on `payroll_benefitconsumption`; uses `NEXT VALUE FOR benefit_code_seq` to assign codes inline |
+```json
+{
+  "benefit_code_pattern": "PAY-[YYYY][MM]-[SEQ:8]"
+}
+```
 
-On first apply, the migration advances the sequence past the current maximum to avoid collisions.
+Tokens: `[SEQ:N]`, `[SEQ]`, `[YY]`, `[YYYY]`, `[MM]` — same as the invoice module. See invoice README for full token reference.
+
+### Trigger auto-sync
+
+The trigger is kept in sync automatically on startup, on config change (`post_save` signal), and via management command:
+
+```bash
+python manage.py sync_code_triggers --module payroll
+python manage.py sync_code_triggers --dry-run
+```
 
 ### Migration
 
-`payroll/migrations/0024_benefit_bill_code_sequences.py` — uses `RunPython` with vendor detection (`schema_editor.connection.vendor`).
+`payroll/migrations/0024_benefit_bill_code_sequences.py` — uses `RunPython` with vendor detection. Fails fast on unsupported DB vendors.
 
 To reverse: `python manage.py migrate payroll 0023`
-
-### Maintainer note: MSSQL trigger column list
-
-The MSSQL `INSTEAD OF INSERT` trigger explicitly lists every column of `payroll_benefitconsumption` in its `INSERT ... SELECT` statement. This is intentional — an `AFTER INSERT` + `UPDATE` approach would double the write I/O for bulk inserts (critical for payroll generation with 100k+ rows).
-
-**When adding or removing columns on `BenefitConsumption`**, you must create a new migration that recreates the trigger with the updated column list. Failure to do so will cause inserts to fail or silently drop values for new columns on MSSQL.
 
 ## Payroll Bulk Creation and Lifecycle
 
