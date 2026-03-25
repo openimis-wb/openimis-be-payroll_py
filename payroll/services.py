@@ -130,8 +130,11 @@ class PayrollService(BaseService):
             if not creation_params:
                 raise ValueError(_("payroll.retrigger.creation_params_not_found"))
 
-            # Clean up partial data from the failed attempt before retrying
-            self._cleanup_payroll_benefits(payroll)
+            # Clean up partial data from the failed attempt before retrying.
+            # Skip cleanup for moved-benefits payrolls to avoid deleting pre-existing data.
+            is_from_failed = (payroll.json_ext or {}).get('creation_params', {}).get('from_failed_invoices_payroll_id')
+            if not is_from_failed:
+                self._cleanup_payroll_benefits(payroll)
 
             payroll.status = PayrollStatus.GENERATING
             if payroll.json_ext:
