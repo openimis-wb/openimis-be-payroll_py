@@ -109,7 +109,6 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             payment_cycle_id=self.payment_cycle.id,
             payment_point_id=self.payment_point.id,
             payment_method=self.payment_method,
-            status=self.status,
             date_valid_from=self.date_valid_from,
             date_valid_to=self.date_valid_to,
             is_deleted=False,
