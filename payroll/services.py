@@ -300,7 +300,8 @@ class PayrollService(BaseService):
         project_ids = filter_criteria.get("project_ids", [])
         if project_ids:
             beneficiaries_queryset = beneficiaries_queryset.filter(
-                project__id__in=project_ids
+                project_enrollments__project__id__in=project_ids,
+                project_enrollments__is_deleted=False
             )
 
         location_ids = filter_criteria.get("location_ids", [])
@@ -324,7 +325,7 @@ class PayrollService(BaseService):
                 beneficiaries_queryset,
             )
 
-        return beneficiaries_queryset
+        return beneficiaries_queryset.distinct()
 
     def _generate_benefits(self, payment_plan, beneficiaries_queryset, date_from, date_to, payroll, payment_cycle):
         calculation = get_calculation_object(payment_plan.calculation)

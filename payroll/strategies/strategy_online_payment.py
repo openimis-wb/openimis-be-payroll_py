@@ -55,6 +55,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         return benefits
 
     @classmethod
+    @register_service_signal("payroll.disbursed")
     def approve_for_payment_benefit_consumption(cls, benefits, user):
         from payroll.models import BenefitConsumptionStatus
         for benefit in benefits:
@@ -65,6 +66,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
                 logger.debug(f"Failed to approve benefit consumption {benefit.code}: {str(e)}")
 
     @classmethod
+    @register_service_signal("payroll.payment_point_reconciled")
     def reconcile_benefit_consumption(cls, benefits, user):
         from payroll.models import BenefitConsumptionStatus
         from payroll.apps import PayrollConfig
