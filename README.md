@@ -367,6 +367,18 @@ The payroll row is committed **before** benefit generation begins so it persists
 
 A `FAILED` payroll can be retriggered via the `retriggerPayroll` GraphQL mutation or `PayrollService.retrigger_creation()`. It re-reads `creation_params` from `json_ext` and re-runs benefit generation.
 
+### Bulk write batch size
+
+Rows per batch for `bulk_create_with_history()`, configurable via `ModuleConfiguration`:
+
+```json
+{
+  "bulk_create_batch_size": 500
+}
+```
+
+Read on each call, so a change applies without a restart.
+
 ## Payment Flow for Offline Payroll Payments
 
 When the `payment_method` of a Payroll is set to `StrategyOfflinePayment`, the configuration described below is required for the offline payment and reconciliation process.

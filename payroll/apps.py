@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "payment_gateway_class": "payroll.payment_gateway.MockedPaymentGatewayConnector",
     "receipt_length": 8,
     "benefit_code_pattern": "BEN-[YY]-[SEQ:10]",
+    "bulk_create_batch_size": 500,
 }
 
 
@@ -97,6 +98,7 @@ class PayrollConfig(AppConfig):
     payment_gateway_class = None
     receipt_length = None
     benefit_code_pattern = None
+    bulk_create_batch_size = None
     benefit_trigger_synced = False
 
     def ready(self):
