@@ -23,7 +23,7 @@ from core.services.utils import (
 from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
-from payroll.apps import PayrollConfig
+from payroll.apps import PayrollConfig, DEFAULT_CONFIG
 from payroll.models import (
     PaymentPoint,
     Payroll,
@@ -64,7 +64,12 @@ class PaymentPointService(BaseService):
         return super().delete(obj_data)
 
 
-PAYROLL_BULK_CREATE_BATCH_SIZE = 500
+def get_bulk_create_batch_size():
+    """Rows per batch for bulk writes, read per call so config changes apply without a restart."""
+    size = PayrollConfig.bulk_create_batch_size
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        return size
+    return DEFAULT_CONFIG["bulk_create_batch_size"]
 
 
 class PayrollService(BaseService):
@@ -155,7 +160,7 @@ class PayrollService(BaseService):
     def bulk_attach_benefits(self, payroll_benefit_consumptions):
         return bulk_create_with_history(
             payroll_benefit_consumptions, PayrollBenefitConsumption,
-            batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE, default_user=self.user,
+            batch_size=get_bulk_create_batch_size(), default_user=self.user,
         )
 
     @register_service_signal('payroll_service.create_task')
@@ -513,14 +518,14 @@ class BenefitConsumptionService(BaseService):
         from invoice.trigger_sync import refresh_trigger_codes
         created = bulk_create_with_history(
             benefits, BenefitConsumption,
-            batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE, default_user=self.user,
+            batch_size=get_bulk_create_batch_size(), default_user=self.user,
         )
-        return refresh_trigger_codes(created, BenefitConsumption, batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE)
+        return refresh_trigger_codes(created, BenefitConsumption, batch_size=get_bulk_create_batch_size())
 
     def bulk_create_attachments(self, attachments):
         return bulk_create_with_history(
             attachments, BenefitAttachment,
-            batch_size=PAYROLL_BULK_CREATE_BATCH_SIZE, default_user=self.user,
+            batch_size=get_bulk_create_batch_size(), default_user=self.user,
         )
 
 
