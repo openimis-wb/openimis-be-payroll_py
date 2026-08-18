@@ -8,7 +8,7 @@ from core.gql.gql_mutations.base_mutation import BaseHistoryModelCreateMutationM
     BaseHistoryModelUpdateMutationMixin, BaseHistoryModelDeleteMutationMixin
 from core.schema import OpenIMISMutation
 from payroll.apps import PayrollConfig
-from payroll.models import PaymentPoint, Payroll, PayrollStatus, PayrollMutation
+from payroll.models import PaymentPoint, Payroll, PayrollMutation
 from payroll.services import PaymentPointService, PayrollService, BenefitConsumptionService
 
 
@@ -33,17 +33,11 @@ class UpdatePaymentGatewayConfigInputType(OpenIMISMutation.Input):
 
 
 class CreatePayrollInput(OpenIMISMutation.Input):
-    class PayrollStatusEnum(graphene.Enum):
-        PENDING_APPROVAL = PayrollStatus.PENDING_APPROVAL
-        APPROVE_FOR_PAYMENT = PayrollStatus.APPROVE_FOR_PAYMENT
-        REJECTED = PayrollStatus.REJECTED
-        RECONCILED = PayrollStatus.RECONCILED
 
     name = graphene.String(required=True, max_length=255)
     payment_plan_id = graphene.UUID(required=True)
     payment_point_id = graphene.UUID(required=False)
     payment_cycle_id = graphene.UUID(required=False)
-    status = graphene.Field(PayrollStatusEnum, required=True)
     payment_method = graphene.String(required=True, max_length=255)
     from_failed_invoices_payroll_id = graphene.UUID(required=False)
 
@@ -310,3 +304,29 @@ class DeleteBenefitConsumptionMutation(BaseHistoryModelDeleteMutationMixin, Base
 
     class Input(DeletePayrollInputType):
         pass
+
+
+class RetriggerPayrollMutation(BaseMutation):
+    _mutation_class = "RetriggerPayrollMutation"
+    _mutation_module = "payroll"
+    _model = Payroll
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        if type(user) is AnonymousUser or not user.has_perms(
+                PayrollConfig.gql_payroll_create_perms):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        data.pop('client_mutation_id', None)
+        data.pop('client_mutation_label', None)
+
+        service = PayrollService(user)
+        response = service.retrigger_creation(data)
+        if not response.get('success', True):
+            return response
+        return None
+
+    class Input(OpenIMISMutation.Input):
+        id = graphene.UUID(required=True)

@@ -23,8 +23,10 @@ from social_protection.models import BenefitPlan, Beneficiary, BeneficiaryStatus
 from social_protection.tests.data import service_add_payload
 from social_protection.tests.test_helpers import create_project
 from location.test_helpers import create_basic_test_locations
+from django.test import override_settings
 
 
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True)
 class PayrollGQLTestCase(openIMISGraphQLTestCase):
 
     user = None
@@ -99,7 +101,7 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
         cls.json_ext_able_bodied_true = """{"advanced_criteria": [{"custom_filter_condition": "able_bodied__boolean=True"}]}"""
         cls.includedUnpaid = False
 
-    def setup(self):
+    def setUp(self):
         payroll = self.payroll_from_db()
         if payroll:
             self.delete_payroll_and_check_bill(payroll)
@@ -114,7 +116,6 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             payment_cycle_id=self.payment_cycle.id,
             payment_point_id=self.payment_point.id,
             payment_method=self.payment_method,
-            status=self.status,
             date_valid_from=self.date_valid_from,
             date_valid_to=self.date_valid_to,
             is_deleted=False,
@@ -137,7 +138,6 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             "paymentPlanId": str(self.payment_plan.id),
             "paymentPointId": str(self.payment_point.id),
             "paymentMethod": self.payment_method,
-            "status": self.status,
             "dateValidFrom": self.date_valid_from,
             "dateValidTo": self.date_valid_to,
             "jsonExt": json_ext,
@@ -155,7 +155,6 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             self.payment_plan.id,
             self.payment_point.id,
             self.payment_method,
-            self.status,
             self.date_valid_from,
             self.date_valid_to,
         )
@@ -381,7 +380,6 @@ class PayrollGQLTestCase(openIMISGraphQLTestCase):
             "paymentCycleId": str(self.payment_cycle.id),
             "paymentPlanId": str(self.payment_plan.id),
             "paymentMethod": self.payment_method,
-            "status": PayrollStatus.PENDING_APPROVAL,
             "dateValidFrom": self.date_valid_from,
             "dateValidTo": self.date_valid_to,
             "jsonExt": self.json_ext_able_bodied_false,

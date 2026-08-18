@@ -11,10 +11,12 @@ from individual.models import Individual
 
 
 class PayrollStatus(models.TextChoices):
+    GENERATING = "GENERATING", _("GENERATING")
     PENDING_APPROVAL = "PENDING_APPROVAL", _("PENDING_APPROVAL")
     APPROVE_FOR_PAYMENT = "APPROVE_FOR_PAYMENT", _("APPROVE_FOR_PAYMENT")
     REJECTED = "REJECTED", _("REJECTED")
     RECONCILED = "RECONCILED", _("RECONCILED")
+    FAILED = "FAILED", _("FAILED")
 
 
 class BenefitConsumptionStatus(models.TextChoices):
@@ -39,7 +41,7 @@ class Payroll(HistoryBusinessModel):
     payment_cycle = models.ForeignKey(PaymentCycle, on_delete=models.DO_NOTHING, blank=True, null=True)
     payment_point = models.ForeignKey(PaymentPoint, on_delete=models.DO_NOTHING, blank=True, null=True)
     status = models.CharField(
-        max_length=100, choices=PayrollStatus.choices, default=PayrollStatus.PENDING_APPROVAL, null=False
+        max_length=100, choices=PayrollStatus.choices, default=PayrollStatus.GENERATING, null=False
     )
     payment_method = models.CharField(max_length=255, blank=True, null=True)
 
@@ -62,7 +64,7 @@ class PaymentAdaptorHistory(HistoryModel):
 class BenefitConsumption(HistoryBusinessModel):
     individual = models.ForeignKey(Individual, on_delete=models.DO_NOTHING)
     photo = models.TextField(blank=True, null=True)
-    code = models.CharField(max_length=255, blank=False, null=False)
+    code = models.CharField(max_length=255, blank=True, default='')
     date_due = DateField(db_column='DateDue', null=True)
     receipt = models.CharField(db_column='Receipt', max_length=255, null=True, blank=True)
     amount = models.DecimalField(db_column='Amount', max_digits=18, decimal_places=2, null=True)
@@ -70,6 +72,18 @@ class BenefitConsumption(HistoryBusinessModel):
     status = models.CharField(
         max_length=100, choices=BenefitConsumptionStatus.choices, default=BenefitConsumptionStatus.ACCEPTED, null=False
     )
+
+    def save(self, *args, **kwargs):
+        is_new = self._state.adding
+        code_was_empty = not self.code
+        result = super().save(*args, **kwargs)
+        if is_new and code_was_empty:
+            self.refresh_from_db(fields=['code'])
+            # Patch history record with DB-assigned code.
+            latest = self.history.filter(history_type='+').order_by('-history_date').values('history_id').first()
+            if latest:
+                self.history.model.objects.filter(history_id=latest['history_id']).update(code=self.code)
+        return result
 
     def __str__(self):
         return f"Benefit Consumption {self.code} - {self.receipt} - {self.amount}"

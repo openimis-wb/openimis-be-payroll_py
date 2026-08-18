@@ -5,7 +5,9 @@
 ### PayrollStatus
 - Represents the status of a payroll.
 - Available statuses:
-  - PENDING_APPROVAL
+  - GENERATING — benefit rows are being created (transient; set before async work begins)
+  - PENDING_APPROVAL — benefit generation completed successfully
+  - FAILED — benefit generation failed; see `json_ext.creation_error` for details
   - APPROVE_FOR_PAYMENT
   - REJECTED
   - RECONCILED
@@ -310,6 +312,72 @@ When the `payment_method` of a Payroll is set to `StrategyOnlinePayment`, the co
    - Unpaid payroll invoices can be recreated during the re-creation of payroll in the reconciled payroll section.
    - The unpaid invoices will be included in the new payroll.
    - Use the `Create Payroll from Unpaid Invoices` button available when you go to `Legal and Finance -> Reconciled Payrolls -> View Reconciled Payroll -> Create Payment from Failed Invoice`.
+
+## BenefitConsumption Code Auto-Generation
+
+`BenefitConsumption.code` is auto-assigned by a database trigger and sequence when `code` is `NULL` or empty. Explicitly supplied codes are preserved.
+
+### Default format
+
+```
+BEN-YY-XXXXXXXXXX
+```
+
+Example: `BEN-26-0000000001`
+
+### Custom code patterns
+
+Configurable via `ModuleConfiguration`:
+
+```json
+{
+  "benefit_code_pattern": "PAY-[YYYY][MM]-[SEQ:8]"
+}
+```
+
+Tokens: `[SEQ:N]`, `[SEQ]`, `[YY]`, `[YYYY]`, `[MM]` — same as the invoice module. See invoice README for full token reference.
+
+### Trigger auto-sync
+
+The trigger is kept in sync automatically on startup, on config change (`post_save` signal), and via management command:
+
+```bash
+python manage.py sync_code_triggers --module payroll
+python manage.py sync_code_triggers --dry-run
+```
+
+### Migration
+
+`payroll/migrations/0024_benefit_bill_code_sequences.py` — uses `RunPython` with vendor detection. Fails fast on unsupported DB vendors.
+
+To reverse: `python manage.py migrate payroll 0023`
+
+## Payroll Bulk Creation and Lifecycle
+
+### Payroll lifecycle
+
+```
+[create] → GENERATING → PENDING_APPROVAL   (success)
+                      → FAILED              (exception during benefit generation)
+```
+
+The payroll row is committed **before** benefit generation begins so it persists even on failure. On failure, `json_ext` stores `creation_params` (original arguments) and `creation_error` (exception message).
+
+### Retriggering a failed payroll
+
+A `FAILED` payroll can be retriggered via the `retriggerPayroll` GraphQL mutation or `PayrollService.retrigger_creation()`. It re-reads `creation_params` from `json_ext` and re-runs benefit generation.
+
+### Bulk write batch size
+
+Rows per batch for `bulk_create_with_history()`, configurable via `ModuleConfiguration`:
+
+```json
+{
+  "bulk_create_batch_size": 500
+}
+```
+
+Read on each call, so a change applies without a restart.
 
 ## Payment Flow for Offline Payroll Payments
 

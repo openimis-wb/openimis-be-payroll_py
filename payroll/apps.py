@@ -1,9 +1,12 @@
+import logging
 import os
 
 from django.apps import AppConfig
 
 from core.custom_filters import CustomFilterRegistryPoint
 from payroll.payments_registry import PaymentsMethodRegistryPoint
+
+logger = logging.getLogger(__name__)
 
 MODULE_NAME = 'payroll'
 
@@ -51,7 +54,9 @@ DEFAULT_CONFIG = {
     "payment_gateway_timeout": 5,
     "payment_gateway_auth_type": "basic",  # can be 'token' or 'basic'
     "payment_gateway_class": "payroll.payment_gateway.MockedPaymentGatewayConnector",
-    "receipt_length": 8
+    "receipt_length": 8,
+    "benefit_code_pattern": "BEN-[YY]-[SEQ:10]",
+    "bulk_create_batch_size": 500,
 }
 
 
@@ -92,6 +97,9 @@ class PayrollConfig(AppConfig):
     payment_gateway_auth_type = None
     payment_gateway_class = None
     receipt_length = None
+    benefit_code_pattern = None
+    bulk_create_batch_size = None
+    benefit_trigger_synced = False
 
     def ready(self):
         from core.models import ModuleConfiguration
@@ -99,6 +107,9 @@ class PayrollConfig(AppConfig):
         cfg = ModuleConfiguration.get_or_default(self.name, DEFAULT_CONFIG)
         self.__load_config(cfg)
         self.__register_filters_and_payment_methods()
+        self._sync_benefit_trigger()
+        self._connect_migrate_signal()
+        self._connect_config_signal()
 
     @classmethod
     def __load_config(cls, cfg):
@@ -126,6 +137,70 @@ class PayrollConfig(AppConfig):
                 StrategyOnlinePayment(),
             ]
         )
+
+    def _sync_benefit_trigger(self):
+        try:
+            from payroll.models import BenefitConsumption
+            from invoice.trigger_sync import sync_trigger
+            sync_trigger(
+                model=BenefitConsumption,
+                sequence_name='benefit_code_seq',
+                trigger_name='benefit_code_trigger',
+                code_column='code',
+                pattern=self.benefit_code_pattern or DEFAULT_CONFIG['benefit_code_pattern'],
+                pg_function_name='set_benefit_code',
+            )
+            PayrollConfig.benefit_trigger_synced = True
+        except Exception as e:
+            PayrollConfig.benefit_trigger_synced = False
+            logger.error(f"Benefit trigger sync failed: {e}", exc_info=True)
+
+    def _connect_migrate_signal(self):
+        # ready() runs before migrations, so on a fresh database the table the trigger
+        # attaches to does not exist yet. Re-sync once migrations have created it.
+        from django.db.models.signals import post_migrate
+        post_migrate.connect(
+            self._on_post_migrate, sender=self,
+            dispatch_uid='payroll.benefit_code_trigger_post_migrate',
+        )
+
+    @staticmethod
+    def _on_post_migrate(sender, **kwargs):
+        sender._sync_benefit_trigger()
+
+    def _connect_config_signal(self):
+        from django.db.models.signals import post_save
+        from core.models import ModuleConfiguration
+        post_save.connect(
+            self._on_config_change, sender=ModuleConfiguration,
+            dispatch_uid='payroll.benefit_code_trigger_sync',
+        )
+
+    @staticmethod
+    def _on_config_change(sender, instance, **kwargs):
+        import json
+        if instance.module != MODULE_NAME or instance.layer != 'be':
+            return
+        try:
+            cfg = json.loads(instance.config) if isinstance(instance.config, str) else instance.config
+            pattern = cfg.get('benefit_code_pattern') or DEFAULT_CONFIG['benefit_code_pattern']
+            from payroll.models import BenefitConsumption
+            from invoice.trigger_sync import sync_trigger, validate_pattern
+            validate_pattern(pattern)
+            PayrollConfig.benefit_code_pattern = pattern
+            sync_trigger(
+                model=BenefitConsumption,
+                sequence_name='benefit_code_seq',
+                trigger_name='benefit_code_trigger',
+                code_column='code',
+                pattern=pattern,
+                pg_function_name='set_benefit_code',
+            )
+            PayrollConfig.benefit_trigger_synced = True
+            logger.info(f"Benefit trigger updated after config change (pattern: {pattern})")
+        except Exception as e:
+            PayrollConfig.benefit_trigger_synced = False
+            logger.error(f"Failed to sync benefit trigger after config change: {e}", exc_info=True)
 
     @staticmethod
     def get_payroll_payment_file_path(payroll_id, file_name=None):

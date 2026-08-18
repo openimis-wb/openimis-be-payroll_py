@@ -1,33 +1,41 @@
+import json
 import logging
 import pandas as pd
 from io import BytesIO
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
+from simple_history.utils import bulk_create_with_history
 from django.db.models import Q
 from django.utils.translation import gettext as _
 
 from core import datetime
 from core.custom_filters import CustomFilterWizardStorage
+from core.utils import to_json_safe_value
 from core.models import InteractiveUser
 from core.services import BaseService
 from core.signals import register_service_signal
-from invoice.models import Bill, PaymentInvoice, DetailPaymentInvoice
+from core.services.utils import (
+    check_authentication,
+    output_exception,
+    model_representation,
+)
+from invoice.models import Bill, BillItem, PaymentInvoice, DetailPaymentInvoice
 from invoice.services import PaymentInvoiceService
 from payment_cycle.models import PaymentCycle
-from payroll.apps import PayrollConfig
+from payroll.apps import PayrollConfig, DEFAULT_CONFIG
 from payroll.models import (
     PaymentPoint,
     Payroll,
+    PayrollStatus,
     PayrollBenefitConsumption,
     BenefitConsumption,
     BenefitAttachment,
     BenefitConsumptionStatus
 )
-from payroll.tasks import send_requests_to_gateway_payment
+from payroll.tasks import send_requests_to_gateway_payment, create_payroll_benefits_task
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
-from core.services.utils import output_exception, check_authentication
 from contribution_plan.models import PaymentPlan
 from social_protection.models import Beneficiary, BeneficiaryStatus
 from tasks_management.apps import TasksManagementConfig
@@ -56,6 +64,14 @@ class PaymentPointService(BaseService):
         return super().delete(obj_data)
 
 
+def get_bulk_create_batch_size():
+    """Rows per batch for bulk writes, read per call so config changes apply without a restart."""
+    size = PayrollConfig.bulk_create_batch_size
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        return size
+    return DEFAULT_CONFIG["bulk_create_batch_size"]
+
+
 class PayrollService(BaseService):
     OBJECT_TYPE = Payroll
 
@@ -66,27 +82,24 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.create')
     def create(self, obj_data):
         try:
+            self._check_triggers_synced()
+            obj_data = self._adjust_create_payload(obj_data)
+
+            obj_data['status'] = PayrollStatus.GENERATING
+
+            json_safe_obj_data = self._recursively_to_json_safe(obj_data)
+            obj_data['json_ext'] = {
+                **self._get_json_ext_as_dict(obj_data),
+                'creation_params': json_safe_obj_data
+            }
+
+            # Commit independently so the row persists even if benefit generation fails.
             with transaction.atomic():
-                obj_data = self._adjust_create_payload(obj_data)
-                from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
-                payment_plan = self._get_payment_plan(obj_data)
-                payment_cycle = self._get_payment_cycle(obj_data)
-                date_valid_from, date_valid_to = self._get_dates_parameter(obj_data)
                 payroll, dict_representation = self._save_payroll(obj_data)
-                if not bool(from_failed_invoices_payroll_id):
-                    beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
-                    self._generate_benefits(
-                        payment_plan,
-                        beneficiaries_queryset,
-                        date_valid_from,
-                        date_valid_to,
-                        payroll,
-                        payment_cycle
-                    )
-                else:
-                    self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
-                self.create_accept_payroll_task(payroll.id, obj_data)
-                return dict_representation
+
+            self._enqueue_benefit_generation(payroll, json_safe_obj_data)
+
+            return dict_representation
         except Exception as exc:
             return output_exception(model_name=self.OBJECT_TYPE.__name__, method="create", exception=exc)
 
@@ -109,10 +122,46 @@ class PayrollService(BaseService):
         })
 
     @check_authentication
+    @register_service_signal('payroll_service.retrigger_creation')
+    def retrigger_creation(self, obj_data):
+        try:
+            self._check_triggers_synced()
+            payroll = Payroll.objects.get(id=obj_data['id'])
+            if payroll.status != PayrollStatus.FAILED:
+                raise ValueError(
+                    f"{_('payroll.retrigger.invalid_status')}: {payroll.status}"
+                )
+            creation_params = (payroll.json_ext or {}).get('creation_params')
+            if not creation_params:
+                raise ValueError(_("payroll.retrigger.creation_params_not_found"))
+
+            # Clean up partial data from the failed attempt before retrying.
+            # Skip cleanup for moved-benefits payrolls to avoid deleting pre-existing data.
+            is_from_failed = (payroll.json_ext or {}).get('creation_params', {}).get('from_failed_invoices_payroll_id')
+            if not is_from_failed:
+                self._cleanup_payroll_benefits(payroll)
+
+            payroll.status = PayrollStatus.GENERATING
+            if payroll.json_ext:
+                payroll.json_ext.pop('creation_error', None)
+            payroll.save(username=self.user.login_name)
+
+            self._enqueue_benefit_generation(payroll, creation_params)
+            return model_representation(payroll)
+        except Exception as exc:
+            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="retrigger_creation", exception=exc)
+
+    @check_authentication
     @register_service_signal('payroll_service.attach_benefit_to_payroll')
     def attach_benefit_to_payroll(self, payroll_id, benefit_id):
         payroll_benefit = PayrollBenefitConsumption(payroll_id=payroll_id, benefit_id=benefit_id)
         payroll_benefit.save(user=self.user)
+
+    def bulk_attach_benefits(self, payroll_benefit_consumptions):
+        return bulk_create_with_history(
+            payroll_benefit_consumptions, PayrollBenefitConsumption,
+            batch_size=get_bulk_create_batch_size(), default_user=self.user,
+        )
 
     @register_service_signal('payroll_service.create_task')
     def create_accept_payroll_task(self, payroll_id, obj_data):
@@ -155,7 +204,60 @@ class PayrollService(BaseService):
 
     def make_payment_for_payroll(self, obj_data):
         payroll_id = obj_data['id']
-        send_requests_to_gateway_payment.delay(payroll_id, self.user.id)
+        send_requests_to_gateway_payment.delay(str(payroll_id), str(self.user.id))
+
+    def _enqueue_benefit_generation(self, payroll, obj_data):
+        """Dispatch Celery task for benefit generation. Marks payroll FAILED on enqueue failure."""
+        try:
+            create_payroll_benefits_task.delay(
+                str(payroll.id), str(self.user.id), dict(obj_data)
+            )
+        except Exception as task_exc:
+            logger.error(f"Failed to enqueue benefit generation for payroll {payroll.id}: {task_exc}", exc_info=True)
+            payroll.status = PayrollStatus.FAILED
+            payroll.json_ext = {**(payroll.json_ext or {}), 'creation_error': str(task_exc)}
+            payroll.save(username=self.user.login_name)
+            raise
+
+    def _check_triggers_synced(self):
+        from invoice.apps import InvoiceConfig
+        from payroll.apps import PayrollConfig
+        bill_synced = getattr(InvoiceConfig, 'bill_trigger_synced', True)
+        benefit_synced = getattr(PayrollConfig, 'benefit_trigger_synced', True)
+        if not bill_synced or not benefit_synced:
+            if self.user and hasattr(self.user, 'is_superuser') and self.user.is_superuser:
+                raise ValueError(_("payroll.create.triggers_not_synced.admin"))
+            raise ValueError(_("payroll.create.triggers_not_synced"))
+
+    def _recursively_to_json_safe(self, obj):
+        if isinstance(obj, dict):
+            return {k: self._recursively_to_json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [self._recursively_to_json_safe(v) for v in obj]
+        return to_json_safe_value(obj)
+
+    @transaction.atomic
+    def _cleanup_payroll_benefits(self, payroll):
+        """Remove all benefits/bills from a failed payroll before retrying."""
+        pbc_qs = PayrollBenefitConsumption.objects.filter(payroll=payroll)
+        benefit_ids = list(pbc_qs.values_list('benefit_id', flat=True))
+        if not benefit_ids:
+            return
+        bill_ids = list(
+            BenefitAttachment.objects.filter(
+                benefit_id__in=benefit_ids
+            ).values_list('bill_id', flat=True)
+        )
+        BenefitAttachment.objects.filter(benefit_id__in=benefit_ids).delete()
+        pbc_qs.delete()
+        BenefitConsumption.objects.filter(id__in=benefit_ids).delete()
+        if bill_ids:
+            BillItem.objects.filter(bill_id__in=bill_ids).delete()
+            Bill.objects.filter(id__in=bill_ids).delete()
+        logger.info(
+            f"Cleaned up {len(benefit_ids)} benefits and {len(bill_ids)} bills "
+            f"from failed payroll {payroll.id}"
+        )
 
     def _save_payroll(self, obj_data):
         obj_ = self.OBJECT_TYPE(**obj_data)
@@ -163,6 +265,16 @@ class PayrollService(BaseService):
         payroll_id = dict_representation["data"]["id"]
         payroll = Payroll.objects.get(id=payroll_id)
         return payroll, dict_representation
+
+    def _get_json_ext_as_dict(self, obj_data):
+        json_ext = obj_data.get("json_ext") or {}
+        if isinstance(json_ext, str):
+            try:
+                json_ext = json.loads(json_ext)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse json_ext as JSON; treating as empty: {json_ext!r}", exc_info=True)
+                json_ext = {}
+        return json_ext
 
     def _get_payment_plan(self, obj_data):
         payment_plan_id = obj_data.get("payment_plan_id")
@@ -180,7 +292,7 @@ class PayrollService(BaseService):
         return date_valid_from, date_valid_to
 
     def _select_beneficiary_based_on_criteria(self, obj_data, payment_plan):
-        json_ext = obj_data.get("json_ext", {})
+        json_ext = self._get_json_ext_as_dict(obj_data)
 
         beneficiaries_queryset = Beneficiary.objects.filter(
             benefit_plan__id=payment_plan.benefit_plan.id,
@@ -241,6 +353,124 @@ class PayrollService(BaseService):
         benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
         benefits.update(status=BenefitConsumptionStatus.ACCEPTED)
 
+    _OPENSEARCH_SYNC_LOCK_ID = 0x4F53_5059
+
+    def _create_payroll_benefits(self, payroll, obj_data):
+        obj_data = dict(obj_data)  # shallow copy — don't mutate caller's dict
+
+        try:
+            from opensearch_reports.models import OpenSearchDashboard
+        except ImportError:
+            OpenSearchDashboard = None
+
+        dashboards_to_toggle = ['Payment', 'Invoice']
+
+        try:
+            try:
+                if OpenSearchDashboard:
+                    self._disable_opensearch_sync(dashboards_to_toggle)
+                from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
+                payment_plan = self._get_payment_plan(obj_data)
+                payment_cycle = self._get_payment_cycle(obj_data)
+                date_valid_from, date_valid_to = self._get_dates_parameter(obj_data)
+
+                if not bool(from_failed_invoices_payroll_id):
+                    beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
+                    self._generate_benefits(
+                        payment_plan,
+                        beneficiaries_queryset,
+                        date_valid_from,
+                        date_valid_to,
+                        payroll,
+                        payment_cycle
+                    )
+                else:
+                    self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
+
+                if payroll.status != PayrollStatus.PENDING_APPROVAL:
+                    payroll.status = PayrollStatus.PENDING_APPROVAL
+                    payroll.save(username=self.user.login_name)
+                self.create_accept_payroll_task(payroll.id, obj_data)
+
+                if OpenSearchDashboard:
+                    self._trigger_opensearch_reindex(payroll)
+            finally:
+                if OpenSearchDashboard:
+                    self._reenable_opensearch_sync(dashboards_to_toggle, payroll.id)
+
+        except Exception as exc:
+            logger.error(f"Error in _create_payroll_benefits for payroll {payroll.id}: {exc}", exc_info=True)
+            try:
+                payroll.status = PayrollStatus.FAILED
+                if payroll.json_ext is None:
+                    payroll.json_ext = {}
+                payroll.json_ext['creation_error'] = str(exc)
+                payroll.json_ext.pop('progress', None)
+                payroll.save(username=self.user.login_name)
+            except Exception as e:
+                logger.error(f"Failed to update payroll {payroll.id} status to FAILED: {e}", exc_info=True)
+            raise
+
+    @staticmethod
+    def _disable_opensearch_sync(dashboards_to_toggle):
+        from opensearch_reports.models import OpenSearchDashboard
+        from django.db import connection
+        if connection.vendor == 'postgresql':
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_lock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
+        OpenSearchDashboard.objects.filter(name__in=dashboards_to_toggle).update(synch_disabled=True)
+
+    @staticmethod
+    def _reenable_opensearch_sync(dashboards_to_toggle, payroll_id):
+        from opensearch_reports.models import OpenSearchDashboard
+        from django.db import connection
+        try:
+            other_generating = Payroll.objects.filter(
+                status=PayrollStatus.GENERATING
+            ).exclude(id=payroll_id).exists()
+            if not other_generating:
+                OpenSearchDashboard.objects.filter(
+                    name__in=dashboards_to_toggle
+                ).update(synch_disabled=False)
+        except Exception as e:
+            logger.error(
+                f"Failed to re-enable OpenSearch sync for payroll {payroll_id}: {e}",
+                exc_info=True,
+            )
+        finally:
+            if connection.vendor == 'postgresql':
+                try:
+                    with connection.cursor() as cursor:
+                        cursor.execute("SELECT pg_advisory_unlock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
+                except Exception as e:
+                    logger.error(f"Failed to release advisory lock: {e}", exc_info=True)
+
+    def _trigger_opensearch_reindex(self, payroll):
+        """Trigger OpenSearch indexing for payroll-related entities."""
+        try:
+            from django_opensearch_dsl.registries import registry
+        except ImportError:
+            return
+
+        try:
+            registry.update(payroll)
+
+            benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
+            registry.update(benefits)
+
+            pbcs = PayrollBenefitConsumption.objects.filter(payroll=payroll)
+            registry.update(pbcs)
+
+            bills = Bill.objects.filter(benefitattachment__benefit__payrollbenefitconsumption__payroll=payroll).distinct()
+            registry.update(bills)
+            registry.update(BillItem.objects.filter(bill__in=bills))
+
+            attachments = BenefitAttachment.objects.filter(benefit__payrollbenefitconsumption__payroll=payroll)
+            registry.update(attachments)
+
+        except Exception as e:
+            logger.error(f"Failed to trigger OpenSearch re-indexing for payroll {payroll.id}: {e}", exc_info=True)
+
 
 class BenefitConsumptionService(BaseService):
     OBJECT_TYPE = BenefitConsumption
@@ -282,6 +512,21 @@ class BenefitConsumptionService(BaseService):
         for bill in bills_queryset:
             benefit_attachment = BenefitAttachment(bill_id=bill.id, benefit_id=benefit_id)
             benefit_attachment.save(user=self.user)
+
+    def bulk_create(self, benefits):
+        """Bulk-create BenefitConsumptions with history. Returns instances with DB-assigned codes."""
+        from invoice.trigger_sync import refresh_trigger_codes
+        created = bulk_create_with_history(
+            benefits, BenefitConsumption,
+            batch_size=get_bulk_create_batch_size(), default_user=self.user,
+        )
+        return refresh_trigger_codes(created, BenefitConsumption, batch_size=get_bulk_create_batch_size())
+
+    def bulk_create_attachments(self, attachments):
+        return bulk_create_with_history(
+            attachments, BenefitAttachment,
+            batch_size=get_bulk_create_batch_size(), default_user=self.user,
+        )
 
 
 class CsvReconciliationService:
@@ -404,6 +649,7 @@ class CsvReconciliationService:
         bc = BenefitConsumption.objects.filter(code=row['code'], is_deleted=False).first()
         if not bc:
             errors.append(_('benefit_consumption_not_found'))
+            return errors
         if not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
             errors.append(_('benefit_consumption_not_in_payroll'))
         if (row[PayrollConfig.csv_reconciliation_paid_extra_field]

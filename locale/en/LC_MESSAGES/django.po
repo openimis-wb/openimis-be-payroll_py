@@ -8,4 +8,16 @@ msgid "payroll.validation.payroll.name_exists"
 msgstr "Name %(name) already exists."
 
 msgid "payroll.validation.field_empty"
-msgstr "Field %(field) can not be empty."
+msgstr "Field %(field) cannot be empty."
+
+msgid "payroll.retrigger.invalid_status"
+msgstr "Cannot retrigger payroll creation unless status is FAILED"
+
+msgid "payroll.retrigger.creation_params_not_found"
+msgstr "Original creation parameters for this payroll could not be found."
+
+msgid "payroll.create.triggers_not_synced"
+msgstr "Payroll creation is temporarily unavailable. Please contact your system administrator."
+
+msgid "payroll.create.triggers_not_synced.admin"
+msgstr "Code generation triggers are not synchronized. Run 'python manage.py sync_code_triggers' or restart the server."

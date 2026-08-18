@@ -2,11 +2,27 @@ import logging
 from celery import shared_task
 
 from core.models import User
-from payroll.models import Payroll, PayrollStatus, BenefitConsumptionStatus
+from payroll.models import (
+    Payroll,
+    PayrollStatus,
+    BenefitConsumptionStatus,
+)
 from payroll.strategies import StrategyOnlinePayment
 from payroll.payments_registry import PaymentMethodStorage
 
 logger = logging.getLogger(__name__)
+
+
+@shared_task
+def create_payroll_benefits_task(payroll_id, user_id, obj_data):
+    from payroll.services import PayrollService
+    try:
+        user = User.objects.get(id=user_id)
+        payroll = Payroll.objects.get(id=payroll_id)
+        PayrollService(user)._create_payroll_benefits(payroll, dict(obj_data))
+    except Exception as exc:
+        logger.error(f"Error in create_payroll_benefits_task for payroll {payroll_id}: {exc}", exc_info=True)
+        raise
 
 
 @shared_task
