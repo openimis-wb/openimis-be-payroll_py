@@ -64,6 +64,23 @@ class PaymentPointService(BaseService):
         return super().delete(obj_data)
 
 
+def get_opensearch_dashboard_model():
+    """Return OpenSearchDashboard, or None when the app is not registered.
+
+    The package may be installed while `opensearch_reports` is absent from
+    INSTALLED_APPS; importing the model in that state raises RuntimeError, not
+    ImportError. Check the app registry first, as payroll/documents.py does.
+    """
+    from django.apps import apps
+    if 'opensearch_reports' not in apps.app_configs:
+        return None
+    try:
+        from opensearch_reports.models import OpenSearchDashboard
+        return OpenSearchDashboard
+    except ImportError:
+        return None
+
+
 def get_bulk_create_batch_size():
     """Rows per batch for bulk writes, read per call so config changes apply without a restart."""
     size = PayrollConfig.bulk_create_batch_size
@@ -358,10 +375,7 @@ class PayrollService(BaseService):
     def _create_payroll_benefits(self, payroll, obj_data):
         obj_data = dict(obj_data)  # shallow copy — don't mutate caller's dict
 
-        try:
-            from opensearch_reports.models import OpenSearchDashboard
-        except ImportError:
-            OpenSearchDashboard = None
+        OpenSearchDashboard = get_opensearch_dashboard_model()
 
         dashboards_to_toggle = ['Payment', 'Invoice']
 
@@ -413,8 +427,10 @@ class PayrollService(BaseService):
 
     @staticmethod
     def _disable_opensearch_sync(dashboards_to_toggle):
-        from opensearch_reports.models import OpenSearchDashboard
         from django.db import connection
+        OpenSearchDashboard = get_opensearch_dashboard_model()
+        if OpenSearchDashboard is None:
+            return
         if connection.vendor == 'postgresql':
             with connection.cursor() as cursor:
                 cursor.execute("SELECT pg_advisory_lock(%s)", [PayrollService._OPENSEARCH_SYNC_LOCK_ID])
@@ -422,8 +438,10 @@ class PayrollService(BaseService):
 
     @staticmethod
     def _reenable_opensearch_sync(dashboards_to_toggle, payroll_id):
-        from opensearch_reports.models import OpenSearchDashboard
         from django.db import connection
+        OpenSearchDashboard = get_opensearch_dashboard_model()
+        if OpenSearchDashboard is None:
+            return
         try:
             other_generating = Payroll.objects.filter(
                 status=PayrollStatus.GENERATING
