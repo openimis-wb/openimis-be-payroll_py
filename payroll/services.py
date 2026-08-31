@@ -298,20 +298,23 @@ class PayrollService(BaseService):
 
     @staticmethod
     def _beneficiary_model_for(payment_plan):
-        """Return the beneficiary model and its location path for a payment plan.
+        """Return the beneficiary model and its location field path for a plan.
 
         A GROUP-type benefit plan is served by GroupBeneficiary; an
         INDIVIDUAL-type one by Beneficiary. The calculation strategies select
         related fields that exist only on their own model, so the queryset built
         here must match the plan type.
+
+        The second element is the lookup path from the beneficiary to its
+        Location, ready to be extended with __uuid or __parent.
         """
         if payment_plan.benefit_plan.type == BenefitPlan.BenefitPlanType.GROUP_TYPE:
-            return GroupBeneficiary, "group"
-        return Beneficiary, "individual"
+            return GroupBeneficiary, "group__location"
+        return Beneficiary, "individual__location"
 
     def _select_beneficiary_based_on_criteria(self, obj_data, payment_plan):
         json_ext = self._get_json_ext_as_dict(obj_data)
-        model, holder = self._beneficiary_model_for(payment_plan)
+        model, location = self._beneficiary_model_for(payment_plan)
 
         beneficiaries_queryset = model.objects.filter(
             benefit_plan__id=payment_plan.benefit_plan.id,
@@ -330,7 +333,6 @@ class PayrollService(BaseService):
 
         location_ids = filter_criteria.get("location_ids", [])
         if location_ids:
-            location = f"{holder}__location"
             beneficiaries_queryset = beneficiaries_queryset.filter(
                 Q(**{f"{location}__uuid__in": location_ids})
                 | Q(**{f"{location}__parent__uuid__in": location_ids})
