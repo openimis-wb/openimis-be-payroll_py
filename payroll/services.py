@@ -37,7 +37,12 @@ from payroll.tasks import send_requests_to_gateway_payment, create_payroll_benef
 from payroll.validation import PaymentPointValidation, PayrollValidation, BenefitConsumptionValidation
 from calculation.services import get_calculation_object
 from contribution_plan.models import PaymentPlan
-from social_protection.models import Beneficiary, BeneficiaryStatus
+from social_protection.models import (
+    Beneficiary,
+    BeneficiaryStatus,
+    BenefitPlan,
+    GroupBeneficiary,
+)
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
 from tasks_management.services import TaskService, _get_std_task_data_payload
@@ -291,10 +296,24 @@ class PayrollService(BaseService):
         date_valid_to = obj_data.get('date_valid_to', None)
         return date_valid_from, date_valid_to
 
+    @staticmethod
+    def _beneficiary_model_for(payment_plan):
+        """Return the beneficiary model and its location path for a payment plan.
+
+        A GROUP-type benefit plan is served by GroupBeneficiary; an
+        INDIVIDUAL-type one by Beneficiary. The calculation strategies select
+        related fields that exist only on their own model, so the queryset built
+        here must match the plan type.
+        """
+        if payment_plan.benefit_plan.type == BenefitPlan.BenefitPlanType.GROUP_TYPE:
+            return GroupBeneficiary, "group"
+        return Beneficiary, "individual"
+
     def _select_beneficiary_based_on_criteria(self, obj_data, payment_plan):
         json_ext = self._get_json_ext_as_dict(obj_data)
+        model, holder = self._beneficiary_model_for(payment_plan)
 
-        beneficiaries_queryset = Beneficiary.objects.filter(
+        beneficiaries_queryset = model.objects.filter(
             benefit_plan__id=payment_plan.benefit_plan.id,
             status=BeneficiaryStatus.ACTIVE,
             is_deleted=False,
@@ -311,11 +330,12 @@ class PayrollService(BaseService):
 
         location_ids = filter_criteria.get("location_ids", [])
         if location_ids:
+            location = f"{holder}__location"
             beneficiaries_queryset = beneficiaries_queryset.filter(
-                Q(individual__location__uuid__in=location_ids)
-                | Q(individual__location__parent__uuid__in=location_ids)
-                | Q(individual__location__parent__parent__uuid__in=location_ids)
-                | Q(individual__location__parent__parent__parent__uuid__in=location_ids)
+                Q(**{f"{location}__uuid__in": location_ids})
+                | Q(**{f"{location}__parent__uuid__in": location_ids})
+                | Q(**{f"{location}__parent__parent__uuid__in": location_ids})
+                | Q(**{f"{location}__parent__parent__parent__uuid__in": location_ids})
             )
 
         custom_filters = [
