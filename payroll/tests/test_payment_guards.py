@@ -8,6 +8,9 @@
 - No payroll is built by moving another payroll's benefits into it.
 - Rejecting an approved payroll never takes back a payment: a benefit sent,
   reconciled or receipted keeps its status and receipt.
+- A benefit the gateway accepted whose save fails is logged at error level,
+  marked ``unpersisted_push`` in a separate write and returned; the push
+  goes on and the gateway task returns what the strategy reports.
 """
 import uuid
 from contextlib import ExitStack, contextmanager
@@ -26,7 +29,7 @@ from payroll.models import (
     PayrollStatus,
 )
 from payroll.services import BenefitConsumptionService, CsvReconciliationService, PayrollService
-from payroll.strategies import StrategyOfPaymentInterface
+from payroll.strategies import StrategyOfPaymentInterface, StrategyOnlinePayment
 from payroll.tasks import send_requests_to_gateway_payment
 
 
@@ -98,6 +101,44 @@ class GatewayTaskStatusGateTest(_Fixtures):
         with self.assertLogs('payroll.tasks', level='ERROR'):
             strategy = self._send(payroll)
         strategy.make_payment_for_payroll.assert_not_called()
+
+    def test_the_task_returns_what_the_strategy_reports(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        strategy = mock.MagicMock()
+        strategy.make_payment_for_payroll.return_value = {'persist_failed': []}
+        with mock.patch('payroll.tasks.PaymentMethodStorage.get_chosen_payment_method',
+                        return_value=strategy):
+            result = send_requests_to_gateway_payment(str(payroll.id), str(self.user.id))
+        self.assertEqual(result, {'persist_failed': []})
+
+
+class ApprovedPushSaveFailureTest(_Fixtures):
+
+    def test_a_failed_save_is_logged_recorded_and_returned(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        first, lost, last = (self._benefit(BenefitConsumptionStatus.ACCEPTED, payroll)
+                             for _ in range(3))
+        real_save = BenefitConsumption.save
+
+        def save(benefit, *args, **kwargs):
+            if benefit.id == lost.id:
+                raise RuntimeError('database unavailable')
+            return real_save(benefit, *args, **kwargs)
+
+        with mock.patch.object(BenefitConsumption, 'save', autospec=True, side_effect=save), \
+                self.assertLogs('payroll.strategies.strategy_online_payment', 'ERROR') as logs:
+            failures = StrategyOnlinePayment.approve_for_payment_benefit_consumption(
+                [first, lost, last], self.user)
+
+        self.assertEqual(failures, [{'benefit_id': str(lost.id), 'code': lost.code,
+                                     'error': 'database unavailable', 'response_recorded': True}])
+        self.assertTrue(any(str(lost.id) in line for line in logs.output))
+        for benefit in (first, last):
+            benefit.refresh_from_db()
+            self.assertEqual(benefit.status, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
+        lost.refresh_from_db()
+        self.assertEqual(lost.status, BenefitConsumptionStatus.ACCEPTED)
+        self.assertEqual(lost.json_ext['unpersisted_push']['error'], 'database unavailable')
 
 
 def restore_benefit_after_refused_deletion(benefit, user):

@@ -9,6 +9,9 @@ from payroll.utils import CodeGenerator
 
 logger = logging.getLogger(__name__)
 
+# json_ext key of a push the gateway accepted whose status could not be saved.
+UNPERSISTED_PUSH_KEY = 'unpersisted_push'
+
 
 class StrategyOnlinePayment(StrategyOfPaymentInterface):
     WORKFLOW_NAME = "payment-adaptor"
@@ -28,7 +31,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
 
     @classmethod
     def make_payment_for_payroll(cls, payroll, user, **kwargs):
-        cls._send_payment_data_to_gateway(payroll, user)
+        return cls._send_payment_data_to_gateway(payroll, user)
 
     @classmethod
     def acknowledge_of_reponse_view(cls, payroll, response_from_gateway, user, rejected_bills):
@@ -56,13 +59,44 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
 
     @classmethod
     def approve_for_payment_benefit_consumption(cls, benefits, user):
+        """Mark benefits the gateway accepted as APPROVE_FOR_PAYMENT.
+
+        A benefit whose save fails is logged at error level, gets
+        ``json_ext.unpersisted_push`` in a separate write, and is returned;
+        the other benefits are still saved. Returns the failures as
+        ``[{'benefit_id', 'code', 'error', 'response_recorded'}]``.
+        """
         from payroll.models import BenefitConsumptionStatus
+        failures = []
         for benefit in benefits:
             try:
-                benefit.status = BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
-                benefit.save(username=user.login_name)
+                with transaction.atomic():
+                    benefit.status = BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
+                    benefit.save(username=user.login_name)
             except Exception as e:
-                logger.debug(f"Failed to approve benefit consumption {benefit.code}: {str(e)}")
+                logger.exception("Push ACCEPTED by the gateway but not saved: benefit %s (code %s)",
+                                 benefit.id, benefit.code)
+                failures.append({'benefit_id': str(benefit.id), 'code': benefit.code,
+                                 'error': str(e)[:500],
+                                 'response_recorded': cls._record_unpersisted_push(benefit, e)})
+        return failures
+
+    @classmethod
+    def _record_unpersisted_push(cls, benefit, error):
+        """Write ``json_ext.unpersisted_push`` on a benefit whose accepted push
+        was not saved, without history or the model's save; True when written."""
+        from django.utils import timezone
+        from payroll.models import BenefitConsumption
+        json_ext = dict(benefit.json_ext) if isinstance(benefit.json_ext, dict) else {}
+        json_ext[UNPERSISTED_PUSH_KEY] = {'at': timezone.now().isoformat(), 'reference': benefit.receipt,
+                                          'error': str(error)[:500]}
+        try:
+            with transaction.atomic():
+                BenefitConsumption.objects.filter(id=benefit.id).update(json_ext=json_ext)
+            return True
+        except Exception:
+            logger.exception("Benefit %s (code %s): accepted push recorded nowhere", benefit.id, benefit.code)
+            return False
 
     @classmethod
     def reconcile_benefit_consumption(cls, benefits, user):
@@ -154,8 +188,11 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
             else:
                 # Handle the case where a benefit payment is rejected
                 logger.info(f"Payment for benefit ({benefit.code}) was rejected.")
+        failures = []
         if benefits_to_approve:
-            cls.approve_for_payment_benefit_consumption(benefits_to_approve, user)
+            failures = cls.approve_for_payment_benefit_consumption(benefits_to_approve, user)
+        return {'payroll_id': str(payroll.id), 'succeeded': len(benefits_to_approve),
+                'persist_failed': failures}
 
     @classmethod
     def _process_accepted_payroll(cls, payroll, user, **kwargs):
