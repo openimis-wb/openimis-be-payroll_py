@@ -6,9 +6,9 @@ from core.signals import bind_service_signal
 from openIMIS.openimisapps import openimis_apps
 from tasks_management.models import Task
 from payroll.apps import PayrollConfig
-from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus
+from payroll.models import Payroll, BenefitConsumption
 from payroll.payments_registry import PaymentMethodStorage
-from payroll.services import PayrollService
+from payroll.services import PayrollService, restore_benefit_after_refused_deletion
 from payroll.strategies import StrategyOfPaymentInterface
 
 
@@ -117,8 +117,7 @@ def bind_service_signals():
                     delete_benefit(benefit, user)
                 if task_status == Task.Status.FAILED:
                     benefit = BenefitConsumption.objects.get(id=task['entity_id'])
-                    benefit.status = BenefitConsumptionStatus.ACCEPTED
-                    benefit.save(username=user.username)
+                    restore_benefit_after_refused_deletion(benefit, user)
         except Exception as exc:
             logger.error("Error while executing on_task_complete_delete_benefit", exc_info=exc)
 
