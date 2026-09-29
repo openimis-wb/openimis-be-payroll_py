@@ -101,7 +101,6 @@ class RefusedDeletionTest(_Fixtures):
         cases = (
             (PayrollStatus.APPROVE_FOR_PAYMENT, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT),
             (PayrollStatus.APPROVE_FOR_PAYMENT, BenefitConsumptionStatus.ACCEPTED),
-            (PayrollStatus.PENDING_APPROVAL, BenefitConsumptionStatus.ACCEPTED),
             (PayrollStatus.REJECTED, BenefitConsumptionStatus.REJECTED),
             (PayrollStatus.REJECTED, BenefitConsumptionStatus.DUPLICATE),
             (PayrollStatus.RECONCILED, BenefitConsumptionStatus.RECONCILED),
@@ -115,8 +114,9 @@ class RefusedDeletionTest(_Fixtures):
                 self.assertEqual(benefit.status, status)
                 self.assertNotIn('pending_deletion', benefit.json_ext)
 
-    def test_a_payable_status_does_not_come_back_in_a_payroll_that_no_longer_pays(self):
-        for payroll_status in (PayrollStatus.REJECTED, PayrollStatus.FAILED, PayrollStatus.RECONCILED):
+    def test_a_payable_status_comes_back_only_in_an_approved_payroll(self):
+        for payroll_status in (PayrollStatus.REJECTED, PayrollStatus.FAILED, PayrollStatus.RECONCILED,
+                               PayrollStatus.PENDING_APPROVAL, 'PENDING_VERIFICATION'):
             for status in (BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT):
                 with self.subTest(payroll_status=payroll_status, status=status):
                     payroll = self._payroll(payroll_status)
