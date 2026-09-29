@@ -480,8 +480,6 @@ PAYABLE_BENEFIT_STATUSES = (
     BenefitConsumptionStatus.CREATED,
     BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
 )
-# Payroll statuses under which no benefit is paid any more.
-CLOSED_PAYROLL_STATUSES = (PayrollStatus.REJECTED, PayrollStatus.FAILED, PayrollStatus.RECONCILED)
 
 
 def restore_benefit_after_refused_deletion(benefit, user):
@@ -494,9 +492,8 @@ def restore_benefit_after_refused_deletion(benefit, user):
     as it is.
 
     A status a payment path reads (ACCEPTED, CREATED, APPROVE_FOR_PAYMENT)
-    comes back only while the benefit is in a live payroll that can still
-    pay it: APPROVE_FOR_PAYMENT, or not yet approved. In a rejected, failed,
-    reconciled or deleted payroll the benefit stays PENDING_DELETION, which
+    comes back only while the benefit is in a live APPROVE_FOR_PAYMENT
+    payroll. In any other payroll the benefit stays PENDING_DELETION, which
     no payment path reads. Returns the restored status, or None.
     """
     if benefit.status != BenefitConsumptionStatus.PENDING_DELETION:
@@ -518,10 +515,12 @@ def restore_benefit_after_refused_deletion(benefit, user):
         return None
     if previous in PAYABLE_BENEFIT_STATUSES and not PayrollBenefitConsumption.objects.filter(
             benefit=benefit, is_deleted=False, payroll__is_deleted=False,
-    ).exclude(payroll__status__in=CLOSED_PAYROLL_STATUSES).exists():
+            payroll__status=PayrollStatus.APPROVE_FOR_PAYMENT,
+    ).exists():
         logger.error(
-            "Deletion of benefit %s refused; its payroll can no longer pay it, so it stays %s "
-            "instead of %s.", benefit.id, BenefitConsumptionStatus.PENDING_DELETION, previous,
+            "Deletion of benefit %s refused; its payroll is not a live %s payroll, so it stays %s "
+            "instead of %s.", benefit.id, PayrollStatus.APPROVE_FOR_PAYMENT,
+            BenefitConsumptionStatus.PENDING_DELETION, previous,
         )
         return None
     json_ext.pop(PENDING_DELETION_KEY, None)
