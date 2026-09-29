@@ -6,9 +6,9 @@ from core.signals import bind_service_signal
 from openIMIS.openimisapps import openimis_apps
 from tasks_management.models import Task
 from payroll.apps import PayrollConfig
-from payroll.models import Payroll, BenefitConsumption, BenefitConsumptionStatus
+from payroll.models import Payroll, BenefitConsumption
 from payroll.payments_registry import PaymentMethodStorage
-from payroll.services import PayrollService
+from payroll.services import PayrollService, restore_benefit_after_refused_deletion
 from payroll.strategies import StrategyOfPaymentInterface
 
 
@@ -22,9 +22,9 @@ def bind_service_signals():
             if strategy:
                 strategy.accept_payroll(payroll, user)
 
-        def reject_payroll(payroll, strategy, user):
+        def reject_payroll(payroll, strategy, user, task_id):
             if strategy:
-                strategy.reject_payroll(payroll, user)
+                strategy.reject_payroll(payroll, user, task_id=task_id)
 
         try:
             result = kwargs.get('result', None)
@@ -39,7 +39,7 @@ def bind_service_signals():
                 if task_status == Task.Status.COMPLETED:
                     accept_payroll(payroll, strategy, user)
                 if task_status == Task.Status.FAILED:
-                    reject_payroll(payroll, strategy, user)
+                    reject_payroll(payroll, strategy, user, task.get('id'))
         except Exception as exc:
             logger.error("Error while executing on_task_complete_accept_payroll", exc_info=exc)
 
@@ -63,10 +63,10 @@ def bind_service_signals():
             logger.error("Error while executing on_task_complete_payroll_reconciliation", exc_info=exc)
 
     def on_task_complete_payroll_reject_approved_payroll(**kwargs):
-        def reject_approved_payroll(payroll, user):
+        def reject_approved_payroll(payroll, user, task_id):
             strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
             if strategy:
-                strategy.reject_approved_payroll(payroll, user)
+                strategy.reject_approved_payroll(payroll, user, task_id=task_id)
         try:
             result = kwargs.get('result', None)
             task = result['data']['task']
@@ -77,7 +77,7 @@ def bind_service_signals():
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
                     payroll = Payroll.objects.get(id=task['entity_id'])
-                    reject_approved_payroll(payroll, user)
+                    reject_approved_payroll(payroll, user, task.get('id'))
         except Exception as exc:
             logger.error("Error while executing on_task_complete_reject_approved_payroll", exc_info=exc)
 
@@ -117,8 +117,7 @@ def bind_service_signals():
                     delete_benefit(benefit, user)
                 if task_status == Task.Status.FAILED:
                     benefit = BenefitConsumption.objects.get(id=task['entity_id'])
-                    benefit.status = BenefitConsumptionStatus.ACCEPTED
-                    benefit.save(username=user.username)
+                    restore_benefit_after_refused_deletion(benefit, user)
         except Exception as exc:
             logger.error("Error while executing on_task_complete_delete_benefit", exc_info=exc)
 

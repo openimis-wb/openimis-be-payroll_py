@@ -1,4 +1,10 @@
 import abc
+import logging
+
+logger = logging.getLogger(__name__)
+
+# json_ext key of a benefit a rejection left in place because it may be paid.
+REJECTION_HOLD_KEY = 'rejection_hold'
 
 
 class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
@@ -22,41 +28,55 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
         cls.remove_benefits_from_rejected_payroll(payroll)
 
     @classmethod
-    def reject_approved_payroll(cls, payroll, user):
-        from django.contrib.contenttypes.models import ContentType
+    def reject_approved_payroll(cls, payroll, user, **kwargs):
+        """Send an approved payroll back to approval without taking back a payment.
+
+        Only a live APPROVE_FOR_PAYMENT payroll is rejected; any other is left
+        as it is and the refusal is logged. A benefit the agency has or may
+        have paid (APPROVE_FOR_PAYMENT, RECONCILED, or holding a receipt) keeps
+        its status, its receipt and its bill payment; ``json_ext.rejection_hold``
+        records the rejection on it. The payroll becomes PENDING_APPROVAL and a
+        new approval task is created.
+        """
+        from django.db.models import Q
+        from django.utils import timezone
         from core.services.utils.serviceUtils import model_representation
         from payroll.models import (
             BenefitConsumption,
             BenefitConsumptionStatus,
+            Payroll,
             PayrollStatus
-        )
-        from invoice.models import (
-            DetailPaymentInvoice,
-            PaymentInvoice,
-            Bill
         )
         from payroll.services import PayrollService
 
-        benefit_data = BenefitConsumption.objects.filter(
-            payrollbenefitconsumption__payroll=payroll,
-            status=BenefitConsumptionStatus.RECONCILED,
-            is_deleted=False
-        )
-        benefit_data_related = list(benefit_data.values_list('id', 'benefitattachment__bill'))
-        if len(benefit_data_related) > 0:
-            benefits, related_bills = zip(*benefit_data_related)
-            bill_content_type = ContentType.objects.get_for_model(Bill)
-            detail_payment_invoices = DetailPaymentInvoice.objects.filter(
-                subject_type=bill_content_type,
-                subject_id__in=related_bills
+        payroll = Payroll.objects.get(id=payroll.id)
+        if payroll.is_deleted or payroll.status != PayrollStatus.APPROVE_FOR_PAYMENT:
+            logger.error(
+                "Rejection of approved payroll %s refused: status %s%s; only a live %s payroll is rejected.",
+                payroll.id, payroll.status, ", deleted" if payroll.is_deleted else "",
+                PayrollStatus.APPROVE_FOR_PAYMENT,
             )
-            payment_invoice_ids = list(detail_payment_invoices.values_list('payment_id', flat=True))
-            detail_payment_invoices.delete()
-            PaymentInvoice.objects.filter(id__in=payment_invoice_ids).delete()
+            return
 
-        for benefit in benefit_data:
-            benefit.receipt = None
-            benefit.status = BenefitConsumptionStatus.ACCEPTED
+        sent_statuses = (BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, BenefitConsumptionStatus.RECONCILED)
+        sent = BenefitConsumption.objects.filter(
+            Q(status__in=sent_statuses) | (Q(receipt__isnull=False) & ~Q(receipt='')),
+            payrollbenefitconsumption__payroll=payroll,
+            payrollbenefitconsumption__is_deleted=False,
+            is_deleted=False,
+        ).distinct()
+        rejection = {
+            'stage': 'approved_payroll_rejected',
+            'at': timezone.now().isoformat(),
+            'by': user.login_name,
+            'task_id': str(kwargs['task_id']) if kwargs.get('task_id') else None,
+            'payroll_id': str(payroll.id),
+        }
+        for benefit in sent:
+            json_ext = dict(benefit.json_ext) if isinstance(benefit.json_ext, dict) else {}
+            reason = f'status {benefit.status}' if benefit.status in sent_statuses else 'receipt'
+            json_ext[REJECTION_HOLD_KEY] = {**rejection, 'reason': reason}
+            benefit.json_ext = json_ext
             benefit.save(username=user.username)
         cls.change_status_of_payroll(payroll, PayrollStatus.PENDING_APPROVAL, user)
         PayrollService(user).create_accept_payroll_task(payroll.id, model_representation(payroll))
