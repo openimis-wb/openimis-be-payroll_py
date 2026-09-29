@@ -22,9 +22,9 @@ def bind_service_signals():
             if strategy:
                 strategy.accept_payroll(payroll, user)
 
-        def reject_payroll(payroll, strategy, user):
+        def reject_payroll(payroll, strategy, user, task_id):
             if strategy:
-                strategy.reject_payroll(payroll, user)
+                strategy.reject_payroll(payroll, user, task_id=task_id)
 
         try:
             result = kwargs.get('result', None)
@@ -39,7 +39,7 @@ def bind_service_signals():
                 if task_status == Task.Status.COMPLETED:
                     accept_payroll(payroll, strategy, user)
                 if task_status == Task.Status.FAILED:
-                    reject_payroll(payroll, strategy, user)
+                    reject_payroll(payroll, strategy, user, task.get('id'))
         except Exception as exc:
             logger.error("Error while executing on_task_complete_accept_payroll", exc_info=exc)
 
