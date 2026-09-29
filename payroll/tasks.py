@@ -28,6 +28,15 @@ def create_payroll_benefits_task(payroll_id, user_id, obj_data):
 @shared_task
 def send_requests_to_gateway_payment(payroll_id, user_id):
     payroll = Payroll.objects.get(id=payroll_id)
+    # The status is read when the task runs: only an approved, live payroll
+    # is sent to the gateway, whatever queued the task.
+    if payroll.is_deleted or payroll.status != PayrollStatus.APPROVE_FOR_PAYMENT:
+        logger.error(
+            "Payment of payroll %s refused: status %s%s; only an %s payroll is sent to the gateway.",
+            payroll_id, payroll.status, ", deleted" if payroll.is_deleted else "",
+            PayrollStatus.APPROVE_FOR_PAYMENT,
+        )
+        return
     strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
     if strategy:
         user = User.objects.get(id=user_id)

@@ -472,6 +472,43 @@ class PayrollService(BaseService):
             logger.error(f"Failed to trigger OpenSearch re-indexing for payroll {payroll.id}: {e}", exc_info=True)
 
 
+# json_ext key holding the status a benefit had when its deletion was requested.
+PENDING_DELETION_KEY = 'pending_deletion'
+
+
+def restore_benefit_after_refused_deletion(benefit, user):
+    """Give a benefit whose deletion was refused back the status it had.
+
+    The status comes from ``json_ext.pending_deletion``, written when the
+    deletion was requested, else from the benefit's last history row that is
+    not PENDING_DELETION. Without either, the benefit stays PENDING_DELETION
+    and the refusal is logged. A benefit no longer PENDING_DELETION is left
+    as it is. Returns the restored status, or None.
+    """
+    if benefit.status != BenefitConsumptionStatus.PENDING_DELETION:
+        return None
+    json_ext = dict(benefit.json_ext) if isinstance(benefit.json_ext, dict) else {}
+    marker = json_ext.get(PENDING_DELETION_KEY)
+    previous = marker.get('previous_status') if isinstance(marker, dict) else None
+    if not previous:
+        row = (benefit.history
+               .exclude(status=BenefitConsumptionStatus.PENDING_DELETION)
+               .order_by('-history_date')
+               .first())
+        previous = row.status if row else None
+    if not previous or previous == BenefitConsumptionStatus.PENDING_DELETION:
+        logger.error(
+            "Deletion of benefit %s refused, but its status before the request is unknown; "
+            "it stays %s.", benefit.id, BenefitConsumptionStatus.PENDING_DELETION,
+        )
+        return None
+    json_ext.pop(PENDING_DELETION_KEY, None)
+    benefit.json_ext = json_ext
+    benefit.status = previous
+    benefit.save(username=user.username)
+    return previous
+
+
 class BenefitConsumptionService(BaseService):
     OBJECT_TYPE = BenefitConsumption
 
@@ -491,6 +528,10 @@ class BenefitConsumptionService(BaseService):
     @register_service_signal('benefit_consumption_service.delete')
     def delete(self, obj_data):
         benefit_to_delete = BenefitConsumption.objects.get(id=obj_data['id'])
+        if benefit_to_delete.status != BenefitConsumptionStatus.PENDING_DELETION:
+            json_ext = dict(benefit_to_delete.json_ext) if isinstance(benefit_to_delete.json_ext, dict) else {}
+            json_ext[PENDING_DELETION_KEY] = {'previous_status': benefit_to_delete.status}
+            benefit_to_delete.json_ext = json_ext
         benefit_to_delete.status = BenefitConsumptionStatus.PENDING_DELETION
         benefit_to_delete.save(user=self.user)
         data = {'id': benefit_to_delete.id}
@@ -675,7 +716,13 @@ class CsvReconciliationService:
         bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
         extra_info = {k: row[k] for k in row.index
                       if k not in PayrollConfig.csv_reconciliation_field_mapping and not pd.isna(row[k])}
-        bc.json_ext = {'extra_info': extra_info}
+        json_ext = dict(bc.json_ext) if isinstance(bc.json_ext, dict) else {}
+        previous_extra_info = json_ext.get('extra_info')
+        json_ext['extra_info'] = {
+            **(previous_extra_info if isinstance(previous_extra_info, dict) else {}),
+            **extra_info,
+        }
+        bc.json_ext = json_ext
         bc.save(username=self.user.login_name)
         bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()
         if bill:
