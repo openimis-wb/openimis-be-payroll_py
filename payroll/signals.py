@@ -63,10 +63,10 @@ def bind_service_signals():
             logger.error("Error while executing on_task_complete_payroll_reconciliation", exc_info=exc)
 
     def on_task_complete_payroll_reject_approved_payroll(**kwargs):
-        def reject_approved_payroll(payroll, user):
+        def reject_approved_payroll(payroll, user, task_id):
             strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
             if strategy:
-                strategy.reject_approved_payroll(payroll, user)
+                strategy.reject_approved_payroll(payroll, user, task_id=task_id)
         try:
             result = kwargs.get('result', None)
             task = result['data']['task']
@@ -77,7 +77,7 @@ def bind_service_signals():
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
                     payroll = Payroll.objects.get(id=task['entity_id'])
-                    reject_approved_payroll(payroll, user)
+                    reject_approved_payroll(payroll, user, task.get('id'))
         except Exception as exc:
             logger.error("Error while executing on_task_complete_reject_approved_payroll", exc_info=exc)
 

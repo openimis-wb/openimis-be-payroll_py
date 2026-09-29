@@ -44,6 +44,19 @@ from tasks_management.services import TaskService, _get_std_task_data_payload
 
 logger = logging.getLogger(__name__)
 
+MOVED_BENEFITS_REFUSAL = (
+    "A payroll is not built from another payroll's benefits (from_failed_invoices_payroll_id): "
+    "the moved benefits may already have been sent to the payment agency and would be paid "
+    "again. Pay benefits voided by a rejection again with recreate_payroll_benefits "
+    "--status-filter DUPLICATE."
+)
+
+
+def refuse_moved_benefits(creation_params):
+    """Raise when payroll creation parameters ask to move another payroll's benefits."""
+    if (creation_params or {}).get('from_failed_invoices_payroll_id'):
+        raise ValueError(MOVED_BENEFITS_REFUSAL)
+
 
 class PaymentPointService(BaseService):
     OBJECT_TYPE = PaymentPoint
@@ -82,6 +95,7 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.create')
     def create(self, obj_data):
         try:
+            refuse_moved_benefits(obj_data)
             self._check_triggers_synced()
             obj_data = self._adjust_create_payload(obj_data)
 
@@ -134,12 +148,10 @@ class PayrollService(BaseService):
             creation_params = (payroll.json_ext or {}).get('creation_params')
             if not creation_params:
                 raise ValueError(_("payroll.retrigger.creation_params_not_found"))
+            refuse_moved_benefits(creation_params)
 
             # Clean up partial data from the failed attempt before retrying.
-            # Skip cleanup for moved-benefits payrolls to avoid deleting pre-existing data.
-            is_from_failed = (payroll.json_ext or {}).get('creation_params', {}).get('from_failed_invoices_payroll_id')
-            if not is_from_failed:
-                self._cleanup_payroll_benefits(payroll)
+            self._cleanup_payroll_benefits(payroll)
 
             payroll.status = PayrollStatus.GENERATING
             if payroll.json_ext:
@@ -192,6 +204,12 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.reject_approve_payroll')
     def reject_approved_payroll(self, obj_data):
         payroll_to_reject = Payroll.objects.get(id=obj_data['id'])
+        if payroll_to_reject.is_deleted or payroll_to_reject.status != PayrollStatus.APPROVE_FOR_PAYMENT:
+            raise ValueError(
+                f"Payroll {payroll_to_reject.id} is {payroll_to_reject.status}"
+                f"{', deleted' if payroll_to_reject.is_deleted else ''}; only a live "
+                f"{PayrollStatus.APPROVE_FOR_PAYMENT} payroll can be rejected after approval."
+            )
         data = {'id': payroll_to_reject.id}
         TaskService(self.user).create({
             'source': 'payroll_reject',
@@ -343,16 +361,6 @@ class PayrollService(BaseService):
             payment_cycle=payment_cycle
         )
 
-    @transaction.atomic
-    def _move_benefit_consumptions(self, payroll, from_payroll_id):
-        payroll_benefits = PayrollBenefitConsumption.objects.filter(
-            payroll_id=from_payroll_id,
-            benefit__status__in=[BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT]
-        )
-        payroll_benefits.update(payroll=payroll)
-        benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
-        benefits.update(status=BenefitConsumptionStatus.ACCEPTED)
-
     _OPENSEARCH_SYNC_LOCK_ID = 0x4F53_5059
 
     def _create_payroll_benefits(self, payroll, obj_data):
@@ -367,25 +375,22 @@ class PayrollService(BaseService):
 
         try:
             try:
+                refuse_moved_benefits(obj_data)
                 if OpenSearchDashboard:
                     self._disable_opensearch_sync(dashboards_to_toggle)
-                from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
                 payment_plan = self._get_payment_plan(obj_data)
                 payment_cycle = self._get_payment_cycle(obj_data)
                 date_valid_from, date_valid_to = self._get_dates_parameter(obj_data)
 
-                if not bool(from_failed_invoices_payroll_id):
-                    beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
-                    self._generate_benefits(
-                        payment_plan,
-                        beneficiaries_queryset,
-                        date_valid_from,
-                        date_valid_to,
-                        payroll,
-                        payment_cycle
-                    )
-                else:
-                    self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
+                beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
+                self._generate_benefits(
+                    payment_plan,
+                    beneficiaries_queryset,
+                    date_valid_from,
+                    date_valid_to,
+                    payroll,
+                    payment_cycle
+                )
 
                 if payroll.status != PayrollStatus.PENDING_APPROVAL:
                     payroll.status = PayrollStatus.PENDING_APPROVAL
@@ -480,6 +485,13 @@ PAYABLE_BENEFIT_STATUSES = (
     BenefitConsumptionStatus.CREATED,
     BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
 )
+# Payroll statuses before closure, the verification step a deployment may add
+# before approval included: a benefit in such a payroll can still be paid.
+OPEN_PAYROLL_STATUSES = (
+    'PENDING_VERIFICATION',
+    PayrollStatus.PENDING_APPROVAL,
+    PayrollStatus.APPROVE_FOR_PAYMENT,
+)
 
 
 def restore_benefit_after_refused_deletion(benefit, user):
@@ -492,9 +504,11 @@ def restore_benefit_after_refused_deletion(benefit, user):
     as it is.
 
     A status a payment path reads (ACCEPTED, CREATED, APPROVE_FOR_PAYMENT)
-    comes back only while the benefit is in a live APPROVE_FOR_PAYMENT
-    payroll. In any other payroll the benefit stays PENDING_DELETION, which
-    no payment path reads. Returns the restored status, or None.
+    comes back only while the benefit is in a live payroll not yet closed:
+    PENDING_VERIFICATION, PENDING_APPROVAL or APPROVE_FOR_PAYMENT. In a
+    rejected, failed, reconciled or deleted payroll the benefit stays
+    PENDING_DELETION, which no payment path reads. Returns the restored
+    status, or None.
     """
     if benefit.status != BenefitConsumptionStatus.PENDING_DELETION:
         return None
@@ -515,11 +529,11 @@ def restore_benefit_after_refused_deletion(benefit, user):
         return None
     if previous in PAYABLE_BENEFIT_STATUSES and not PayrollBenefitConsumption.objects.filter(
             benefit=benefit, is_deleted=False, payroll__is_deleted=False,
-            payroll__status=PayrollStatus.APPROVE_FOR_PAYMENT,
+            payroll__status__in=OPEN_PAYROLL_STATUSES,
     ).exists():
         logger.error(
-            "Deletion of benefit %s refused; its payroll is not a live %s payroll, so it stays %s "
-            "instead of %s.", benefit.id, PayrollStatus.APPROVE_FOR_PAYMENT,
+            "Deletion of benefit %s refused; its payroll is closed, rejected, failed or deleted, "
+            "so it stays %s instead of %s.", benefit.id,
             BenefitConsumptionStatus.PENDING_DELETION, previous,
         )
         return None
