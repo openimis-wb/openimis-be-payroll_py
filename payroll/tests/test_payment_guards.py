@@ -98,16 +98,39 @@ class RefusedDeletionTest(_Fixtures):
         return benefit
 
     def test_the_status_before_the_request_comes_back(self):
-        payroll = self._payroll(PayrollStatus.REJECTED)
-        for status in (BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
-                       BenefitConsumptionStatus.REJECTED,
-                       BenefitConsumptionStatus.DUPLICATE):
-            with self.subTest(status=status):
+        cases = (
+            (PayrollStatus.APPROVE_FOR_PAYMENT, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT),
+            (PayrollStatus.APPROVE_FOR_PAYMENT, BenefitConsumptionStatus.ACCEPTED),
+            (PayrollStatus.PENDING_APPROVAL, BenefitConsumptionStatus.ACCEPTED),
+            (PayrollStatus.REJECTED, BenefitConsumptionStatus.REJECTED),
+            (PayrollStatus.REJECTED, BenefitConsumptionStatus.DUPLICATE),
+            (PayrollStatus.RECONCILED, BenefitConsumptionStatus.RECONCILED),
+        )
+        for payroll_status, status in cases:
+            with self.subTest(payroll_status=payroll_status, status=status):
+                payroll = self._payroll(payroll_status)
                 benefit = self._request_deletion(self._benefit(status, payroll))
                 self.assertEqual(restore_benefit_after_refused_deletion(benefit, self.user), status)
                 benefit.refresh_from_db()
                 self.assertEqual(benefit.status, status)
                 self.assertNotIn('pending_deletion', benefit.json_ext)
+
+    def test_a_payable_status_does_not_come_back_in_a_payroll_that_no_longer_pays(self):
+        for payroll_status in (PayrollStatus.REJECTED, PayrollStatus.FAILED, PayrollStatus.RECONCILED):
+            for status in (BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT):
+                with self.subTest(payroll_status=payroll_status, status=status):
+                    payroll = self._payroll(payroll_status)
+                    benefit = self._request_deletion(self._benefit(status, payroll))
+                    with self.assertLogs('payroll.services', level='ERROR'):
+                        self.assertIsNone(restore_benefit_after_refused_deletion(benefit, self.user))
+                    benefit.refresh_from_db()
+                    self.assertEqual(benefit.status, BenefitConsumptionStatus.PENDING_DELETION)
+
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        benefit = self._request_deletion(self._benefit(BenefitConsumptionStatus.ACCEPTED, payroll))
+        Payroll.objects.filter(id=payroll.id).update(is_deleted=True)
+        with self.assertLogs('payroll.services', level='ERROR'):
+            self.assertIsNone(restore_benefit_after_refused_deletion(benefit, self.user))
 
     def test_a_request_made_before_the_marker_existed_reads_the_history(self):
         benefit = self._benefit(BenefitConsumptionStatus.REJECTED)
