@@ -41,9 +41,11 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         # The reconciliation task calls the payment gateway and sets the payroll
         # RECONCILED. The receiver of a task completion runs inside the resolving
         # transaction, so the task is queued once that commits, never on rollback.
+        # A queueing failure is logged; it does not fail the resolution.
         from payroll.tasks import send_request_to_reconcile
         payroll_id, user_id = payroll.id, user.id
-        transaction.on_commit(lambda: send_request_to_reconcile.delay(payroll_id, user_id))
+        transaction.on_commit(
+            lambda: send_request_to_reconcile.delay(payroll_id, user_id), robust=True)
 
     @classmethod
     def get_benefits_attached_to_payroll(cls, payroll, status):
