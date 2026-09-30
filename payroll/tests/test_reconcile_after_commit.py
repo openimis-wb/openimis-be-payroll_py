@@ -67,6 +67,18 @@ class ReconcileAfterCommitTest(TestCase):
                         raise _ResolutionAborted()
             delay.assert_not_called()
 
+    def test_a_broker_failure_after_the_commit_is_logged_not_raised(self):
+        _, task = self._reconciliation_task()
+        with mock.patch.object(send_request_to_reconcile, 'delay',
+                               side_effect=RuntimeError('broker down')) as delay:
+            with self.assertLogs(level='ERROR'):
+                with self.captureOnCommitCallbacks(execute=True):
+                    with transaction.atomic():
+                        self._complete(task)
+            delay.assert_called_once()
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+
     def test_a_payroll_without_a_registered_strategy_queues_nothing(self):
         _, task = self._reconciliation_task(payment_method='StrategyNotRegistered')
         with mock.patch.object(send_request_to_reconcile, 'delay') as delay:
