@@ -13,6 +13,15 @@ logger = logging.getLogger(__name__)
 UNPERSISTED_PUSH_KEY = 'unpersisted_push'
 
 
+def send_accepted(result):
+    """True when a connector's ``send_payment`` result says the gateway took
+    the payment: a boolean, or the ``success`` of a ``{'success', 'data',
+    'error'}`` dict."""
+    if isinstance(result, dict):
+        return result.get('success') is True
+    return bool(result)
+
+
 class StrategyOnlinePayment(StrategyOfPaymentInterface):
     WORKFLOW_NAME = "payment-adaptor"
     WORKFLOW_GROUP = "openimis-coremis-payment-adaptor"
@@ -102,18 +111,24 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
     @classmethod
     @register_service_signal("payroll.payment_point_reconciled")
     def reconcile_benefit_consumption(cls, benefits, user):
+        """Mark benefits the gateway confirmed as RECONCILED.
+
+        A benefit keeps the receipt it already holds; one without a receipt
+        gets a generated one. A benefit whose save fails is logged at error
+        level and the others are still reconciled.
+        """
         from payroll.models import BenefitConsumptionStatus
         from payroll.apps import PayrollConfig
         from invoice.models import Bill
         for benefit in benefits:
             try:
-                receipt = CodeGenerator.generate_unique_code(
-                    'payroll',
-                    'BenefitConsumption',
-                    'receipt',
-                    PayrollConfig.receipt_length,
-                )
-                benefit.receipt = receipt
+                if not benefit.receipt:
+                    benefit.receipt = CodeGenerator.generate_unique_code(
+                        'payroll',
+                        'BenefitConsumption',
+                        'receipt',
+                        PayrollConfig.receipt_length,
+                    )
                 benefit.status = BenefitConsumptionStatus.RECONCILED
                 benefit.save(username=user.login_name)
                 bill = Bill.objects.filter(
@@ -122,8 +137,9 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
                 ).first()
                 if bill:
                     cls._create_bill_payment_for_paid_bill(benefit, bill, user)
-            except Exception as e:
-                logger.debug(f"Failed to approve benefit consumption {benefit.code}: {str(e)}")
+            except Exception:
+                logger.exception("Gateway confirmed the payment but the reconciliation was not saved: "
+                                 "benefit %s (code %s)", benefit.id, benefit.code)
 
     @classmethod
     def _create_bill_payment_for_paid_bill(cls, benefit, bill, user):
@@ -185,7 +201,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         payment_gateway_connector = cls.PAYMENT_GATEWAY
         benefits_to_approve = []
         for benefit in benefits:
-            if payment_gateway_connector.send_payment(benefit.code, benefit.amount):
+            if send_accepted(payment_gateway_connector.send_payment(benefit.code, benefit.amount)):
                 benefits_to_approve.append(benefit)
             else:
                 # Handle the case where a benefit payment is rejected
