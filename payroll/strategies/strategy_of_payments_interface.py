@@ -235,40 +235,47 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
         return held
 
     @classmethod
-    def remove_benefit_from_payroll(cls, benefit):
+    def remove_benefit_from_payroll(cls, benefit, user=None):
+        """Delete one benefit whose deletion task was approved; True when deleted.
+
+        Runs in one transaction holding the benefit's payroll rows, then its
+        row (``lock_benefit_for_deletion``). A benefit already deleted is left
+        as it is. A benefit that check keeps (a payroll its agency may have
+        paid from as a whole, a benefit that may have been paid, read on its
+        status before the request) is not deleted: the refusal is logged and,
+        with ``user``, the benefit gets back its status before the request
+        (``restore_benefit_after_refused_deletion``). Otherwise the benefit is
+        deleted with its attachments, bills, bill items and payroll links.
+        """
+        from django.db import transaction
         from payroll.models import (
             BenefitAttachment,
             BenefitConsumption,
             PayrollBenefitConsumption
         )
+        from payroll.services import lock_benefit_for_deletion, restore_benefit_after_refused_deletion
         from invoice.models import (
             Bill,
             BillItem
         )
 
-        benefit_data = BenefitConsumption.objects.filter(
-            id=benefit.id,
-            is_deleted=False
-        ).values_list('id', 'benefitattachment__bill')
+        with transaction.atomic():
+            locked, refusal = lock_benefit_for_deletion(benefit.id)
+            if locked is None:
+                logger.error("Deletion of benefit %s refused: it does not exist or is already deleted; "
+                             "nothing was done.", benefit.id)
+                return False
+            if refusal:
+                logger.error("Deletion of benefit %s refused: %s; nothing was deleted.", locked.id, refusal)
+                if user is not None:
+                    restore_benefit_after_refused_deletion(locked, user)
+                return False
 
-        if len(benefit_data) > 0:
-            benefits, related_bills = zip(*benefit_data)
-
-            BenefitAttachment.objects.filter(
-                benefit_id__in=benefits
-            ).delete()
-
-            BillItem.objects.filter(
-                bill__id__in=related_bills
-            ).delete()
-
-            Bill.objects.filter(
-                id__in=related_bills
-            ).delete()
-
-            PayrollBenefitConsumption.objects.filter(benefit=benefit).delete()
-
-            BenefitConsumption.objects.filter(
-                id__in=benefits,
-                is_deleted=False
-            ).delete()
+            related_bills = [bill_id for bill_id in BenefitAttachment.objects.filter(
+                benefit_id=locked.id).values_list('bill_id', flat=True) if bill_id]
+            BenefitAttachment.objects.filter(benefit_id=locked.id).delete()
+            BillItem.objects.filter(bill__id__in=related_bills).delete()
+            Bill.objects.filter(id__in=related_bills).delete()
+            PayrollBenefitConsumption.objects.filter(benefit_id=locked.id).delete()
+            BenefitConsumption.objects.filter(id=locked.id, is_deleted=False).delete()
+        return True

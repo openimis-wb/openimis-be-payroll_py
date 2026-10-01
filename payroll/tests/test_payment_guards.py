@@ -13,6 +13,8 @@
   goes on and the gateway task returns what the strategy reports.
 - Rejecting a payroll at approval keeps live and holds what an agency may
   have paid; the deletion of a payroll holding such a benefit is refused.
+- A single benefit an agency may have paid, or one in an approved payroll
+  whose agency pulls its list, is neither put up for deletion nor deleted.
 - The base online strategy reads a connector's dict result by its
   ``success``, keeps a receipt the benefit holds, and logs a failed
   reconciliation save at error level.
@@ -151,11 +153,33 @@ def restore_benefit_after_refused_deletion(benefit, user):
     return restore(benefit, user)
 
 
+def _create_deletion_task(user, benefit):
+    """The task ``BenefitConsumptionService.delete`` creates for a benefit."""
+    from tasks_management.apps import TasksManagementConfig
+    from tasks_management.models import Task
+    from tasks_management.services import TaskService, _get_std_task_data_payload
+
+    TaskService(user).create({
+        'source': 'benefit_delete',
+        'entity': benefit,
+        'status': Task.Status.RECEIVED,
+        'executor_action_event': TasksManagementConfig.default_executor_event,
+        'business_event': PayrollConfig.benefit_delete_event,
+        'data': _get_std_task_data_payload({'id': benefit.id}),
+    })
+
+
 class RefusedDeletionTest(_Fixtures):
 
     def _request_deletion(self, benefit):
-        with mock.patch('payroll.services.TaskService'):
-            BenefitConsumptionService(self.user).delete({'id': benefit.id})
+        """The benefit as a deletion request leaves it. Written directly: the
+        service refuses the request for a benefit an agency may have paid,
+        and a request made before that rule left such benefits pending."""
+        json_ext = dict(benefit.json_ext or {})
+        json_ext['pending_deletion'] = {'previous_status': benefit.status}
+        benefit.json_ext = json_ext
+        benefit.status = BenefitConsumptionStatus.PENDING_DELETION
+        benefit.save(username=self.user.username)
         benefit.refresh_from_db()
         self.assertEqual(benefit.status, BenefitConsumptionStatus.PENDING_DELETION)
         return benefit
@@ -231,9 +255,9 @@ class RefusedDeletionTest(_Fixtures):
         from tasks_management.models import Task
         from tasks_management.services import TaskService
 
-        benefit = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
-                                self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT))
-        BenefitConsumptionService(self.user).delete({'id': benefit.id})
+        benefit = self._request_deletion(self._benefit(
+            BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)))
+        _create_deletion_task(self.user, benefit)
         task = Task.objects.get(entity_id=str(benefit.id),
                                 business_event=PayrollConfig.benefit_delete_event)
 
@@ -943,3 +967,273 @@ class PayrollDeletionRaceTest(SimpleTestCase):
             sorted(BenefitConsumption.objects.filter(id__in=self.ids).values_list('status', flat=True)),
             [BenefitConsumptionStatus.APPROVE_FOR_PAYMENT] * 3)
         self.assertFalse(Payroll.objects.get(id=self.payroll.id).is_deleted)
+
+
+class BenefitDeletionRequestTest(_RowsFixtures):
+    """A benefit is put up for deletion only when no agency may have paid it
+    and its payroll's list cannot have been pulled; a refused request leaves
+    the benefit as it is and creates no task."""
+
+    def _deletion_tasks(self, benefit):
+        from tasks_management.models import Task
+        return Task.objects.filter(entity_id=str(benefit.id),
+                                   business_event=PayrollConfig.benefit_delete_event)
+
+    def assertRefused(self, benefit, status, strategy=None):
+        before = BenefitConsumption.objects.get(id=benefit.id)
+        with mock.patch('payroll.payments_registry.PaymentMethodStorage.get_chosen_payment_method',
+                        return_value=strategy), \
+                self.assertRaises(ValueError):
+            BenefitConsumptionService(self.user).delete({'id': benefit.id})
+        row = BenefitConsumption.objects.get(id=benefit.id)
+        self.assertEqual((row.status, row.json_ext), (status, before.json_ext))
+        self.assertFalse(self._deletion_tasks(benefit).exists())
+
+    def test_a_benefit_an_agency_may_have_paid_is_refused(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        for status, receipt in ((BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, None),
+                                (BenefitConsumptionStatus.RECONCILED, 'RCPT-9'),
+                                (BenefitConsumptionStatus.ACCEPTED, 'RCPT-10')):
+            with self.subTest(status=status, receipt=receipt):
+                benefit, _ = self._billed(status, payroll, receipt=receipt)
+                self.assertRefused(benefit, status)
+
+    def test_a_benefit_of_an_approved_payroll_whose_agency_pulls_its_list_is_refused(self):
+        for payroll_status in (PayrollStatus.APPROVE_FOR_PAYMENT, PayrollStatus.RECONCILED):
+            with self.subTest(payroll_status=payroll_status):
+                benefit, _ = self._billed(BenefitConsumptionStatus.ACCEPTED, self._payroll(payroll_status))
+                self.assertRefused(benefit, BenefitConsumptionStatus.ACCEPTED, _TestPullStrategy)
+
+    def test_the_payrolls_own_strategy_reads_the_benefit(self):
+        class Strategy(StrategyOnlinePayment):
+            @classmethod
+            def sent_benefit_reasons(cls, benefits):
+                return {b.id: 'send attempt' for b in benefits if 'send_attempt' in (b.json_ext or {})}
+
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        benefit = self._benefit(BenefitConsumptionStatus.ACCEPTED, payroll, json_ext={'send_attempt': {'id': 'a'}})
+        self.assertRefused(benefit, BenefitConsumptionStatus.ACCEPTED, Strategy)
+
+    def test_a_benefit_nothing_was_paid_from_is_put_up_for_deletion(self):
+        for payroll_status in (PayrollStatus.PENDING_APPROVAL, PayrollStatus.APPROVE_FOR_PAYMENT):
+            with self.subTest(payroll_status=payroll_status):
+                benefit, _ = self._billed(BenefitConsumptionStatus.ACCEPTED, self._payroll(payroll_status))
+                BenefitConsumptionService(self.user).delete({'id': benefit.id})
+                row = BenefitConsumption.objects.get(id=benefit.id)
+                self.assertEqual(row.status, BenefitConsumptionStatus.PENDING_DELETION)
+                self.assertEqual(row.json_ext['pending_deletion'],
+                                 {'previous_status': BenefitConsumptionStatus.ACCEPTED})
+                self.assertEqual(self._deletion_tasks(benefit).count(), 1)
+
+    def test_a_deleted_benefit_is_refused(self):
+        benefit, _ = self._billed(BenefitConsumptionStatus.ACCEPTED, self._payroll(PayrollStatus.PENDING_APPROVAL))
+        BenefitConsumption.objects.filter(id=benefit.id).update(is_deleted=True)
+        with self.assertRaises(ValueError):
+            BenefitConsumptionService(self.user).delete({'id': benefit.id})
+        self.assertFalse(self._deletion_tasks(benefit).exists())
+
+
+class BenefitDeletionTaskTest(_RowsFixtures):
+    """Under the locks of its payrolls and its row, the approved deletion task
+    reads the benefit again, on its status before the request: a benefit an
+    agency may have paid, or one of a payroll approved since whose agency
+    pulls its list, is kept and gets its status back. ``pre_delete`` fires
+    only for a benefit actually deleted."""
+
+    def _requested(self, status, payroll_status, json_ext=None):
+        payroll = self._payroll(payroll_status)
+        benefit, bill = self._billed(status, payroll)
+        if json_ext:
+            BenefitConsumption.objects.filter(id=benefit.id).update(json_ext=json_ext)
+        benefit = BenefitConsumption.objects.get(id=benefit.id)
+        benefit.json_ext = {**(benefit.json_ext or {}), 'pending_deletion': {'previous_status': status}}
+        benefit.status = BenefitConsumptionStatus.PENDING_DELETION
+        benefit.save(username=self.user.username)
+        return payroll, BenefitConsumption.objects.get(id=benefit.id), bill
+
+    def _remove(self, benefit, strategy=None):
+        from django.db.models.signals import pre_delete
+        fired = []
+
+        def receiver(sender, instance, **kwargs):
+            fired.append(instance.id)
+
+        pre_delete.connect(receiver, sender=BenefitConsumption, weak=False)
+        try:
+            with mock.patch('payroll.payments_registry.PaymentMethodStorage.get_chosen_payment_method',
+                            return_value=strategy):
+                removed = StrategyOfPaymentInterface.remove_benefit_from_payroll(benefit=benefit, user=self.user)
+        finally:
+            pre_delete.disconnect(receiver, sender=BenefitConsumption)
+        return removed, fired
+
+    def assertKeptWith(self, benefit, status):
+        from payroll.models import BenefitAttachment
+        row = BenefitConsumption.objects.get(id=benefit.id)
+        self.assertEqual((row.is_deleted, row.status), (False, status))
+        self.assertNotIn('pending_deletion', row.json_ext)
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(benefit_id=benefit.id, is_deleted=False).exists())
+        self.assertTrue(BenefitAttachment.objects.filter(benefit_id=benefit.id, is_deleted=False).exists())
+
+    def test_a_benefit_nothing_was_paid_from_is_deleted(self):
+        _, benefit, bill = self._requested(BenefitConsumptionStatus.ACCEPTED, PayrollStatus.PENDING_APPROVAL)
+        removed, fired = self._remove(benefit)
+        self.assertTrue(removed)
+        self.assertEqual(fired, [benefit.id])
+        self.assertRemoved(benefit, bill)
+
+    def test_a_benefit_sent_before_its_request_is_kept(self):
+        for status in (BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, BenefitConsumptionStatus.RECONCILED):
+            with self.subTest(status=status):
+                _, benefit, _ = self._requested(status, PayrollStatus.APPROVE_FOR_PAYMENT)
+                with self.assertLogs('payroll.strategies', level='ERROR'):
+                    removed, fired = self._remove(benefit)
+                self.assertFalse(removed)
+                self.assertEqual(fired, [])
+                self.assertKeptWith(benefit, status)
+
+    def test_a_benefit_of_a_payroll_approved_since_whose_agency_pulls_its_list_is_kept(self):
+        payroll, benefit, _ = self._requested(BenefitConsumptionStatus.ACCEPTED, PayrollStatus.PENDING_APPROVAL)
+        Payroll.objects.filter(id=payroll.id).update(status=PayrollStatus.APPROVE_FOR_PAYMENT)
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            removed, fired = self._remove(benefit, _TestPullStrategy)
+        self.assertFalse(removed)
+        self.assertEqual(fired, [])
+        self.assertKeptWith(benefit, BenefitConsumptionStatus.ACCEPTED)
+
+    def test_the_payrolls_own_strategy_reads_the_benefit(self):
+        class Strategy(StrategyOnlinePayment):
+            @classmethod
+            def sent_benefit_reasons(cls, benefits):
+                return {b.id: 'send attempt' for b in benefits if 'send_attempt' in (b.json_ext or {})}
+
+        _, benefit, _ = self._requested(BenefitConsumptionStatus.ACCEPTED, PayrollStatus.APPROVE_FOR_PAYMENT,
+                                        json_ext={'send_attempt': {'id': 'a'}})
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            removed, fired = self._remove(benefit, Strategy)
+        self.assertFalse(removed)
+        self.assertEqual(fired, [])
+        self.assertKeptWith(benefit, BenefitConsumptionStatus.ACCEPTED)
+
+    def test_an_already_deleted_benefit_is_left_as_it_is(self):
+        _, benefit, _ = self._requested(BenefitConsumptionStatus.ACCEPTED, PayrollStatus.PENDING_APPROVAL)
+        BenefitConsumption.objects.filter(id=benefit.id).update(is_deleted=True)
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            removed, fired = self._remove(benefit)
+        self.assertFalse(removed)
+        self.assertEqual(fired, [])
+        self.assertTrue(BenefitConsumption.objects.filter(id=benefit.id).exists())
+
+    def test_the_approved_task_keeps_a_benefit_sent_before_its_request(self):
+        """End to end through ``task_service.complete_task``."""
+        from tasks_management.models import Task
+        from tasks_management.services import TaskService
+
+        _, benefit, _ = self._requested(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+                                        PayrollStatus.APPROVE_FOR_PAYMENT)
+        _create_deletion_task(self.user, benefit)
+        task = Task.objects.get(entity_id=str(benefit.id), business_event=PayrollConfig.benefit_delete_event)
+
+        TaskService(self.user).complete_task({'id': task.id})
+
+        self.assertKeptWith(benefit, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
+
+
+class BenefitDeletionRaceTest(SimpleTestCase):
+    """The deletion of one benefit against a send of it and against the
+    approval of its payroll, in two committed transactions.
+
+    Runs outside a test transaction, so each thread sees the other's
+    commits; the rows it creates are removed in ``tearDown``.
+    """
+    databases = {'default'}
+    WAIT = 20
+
+    def setUp(self):
+        self.user = LogInHelper().get_or_create_user_api(username='benefit_race_user')
+        self.individual = Individual(first_name='Course', last_name='Ligne', dob='1990-01-01')
+        self.individual.save(username=self.user.username)
+        self.payroll = Payroll(name=f'RACE-{uuid.uuid4().hex[:6]}', status=PayrollStatus.APPROVE_FOR_PAYMENT,
+                               payment_method='StrategyGuardTest', json_ext={})
+        self.payroll.save(username=self.user.username)
+        self.benefit = BenefitConsumption(
+            individual=self.individual, code=f'RACE-{uuid.uuid4().hex[:8]}', amount=72000,
+            type='Cash Transfer', status=BenefitConsumptionStatus.ACCEPTED,
+            date_due=date(2026, 10, 1), json_ext={})
+        self.benefit.save(username=self.user.username)
+        PayrollBenefitConsumption(payroll=self.payroll, benefit=self.benefit).save(username=self.user.username)
+
+    def tearDown(self):
+        PayrollBenefitConsumption.objects.filter(payroll_id=self.payroll.id).delete()
+        BenefitConsumption.objects.filter(id=self.benefit.id).delete()
+        Payroll.objects.filter(id=self.payroll.id).delete()
+        Individual.objects.filter(id=self.individual.id).delete()
+
+    _in_thread = PayrollDeletionRaceTest._in_thread
+    _wait_for_lock = PayrollDeletionRaceTest._wait_for_lock
+
+    def _holding(self, model, row_id, update, locked, release):
+        """Lock one row, wait for ``release``, write ``update`` on it, commit."""
+        from django.db import transaction
+        with transaction.atomic():
+            model.objects.select_for_update().get(id=row_id)
+            locked.set()
+            release.wait(self.WAIT)
+            model.objects.filter(id=row_id).update(**update)
+
+    def _race(self, model, row_id, update, deletion):
+        """Run ``deletion`` while another transaction holds the row; returns
+        (whether the deletion waited, the holder's result, the deletion's)."""
+        import threading
+
+        locked, release, started = threading.Event(), threading.Event(), threading.Event()
+        holder, result = {}, {}
+        holding = self._in_thread(lambda: self._holding(model, row_id, update, locked, release), holder)
+        self.assertTrue(locked.wait(self.WAIT), 'the other transaction never locked its row')
+        deleting = self._in_thread(deletion, result, started)
+        try:
+            waited = started.wait(self.WAIT) and self._wait_for_lock(result['pid'])
+        finally:
+            release.set()
+            holding.join(self.WAIT)
+            deleting.join(self.WAIT)
+        self.assertNotIn('error', holder)
+        return waited, result
+
+    def test_a_request_during_a_send_waits_and_is_refused(self):
+        """A sender holds the benefit and marks it sent: the deletion request
+        waits for its commit, then finds it sent and leaves it as it is."""
+        with mock.patch('payroll.services.TaskService') as tasks:
+            waited, request = self._race(
+                BenefitConsumption, self.benefit.id, {'status': BenefitConsumptionStatus.APPROVE_FOR_PAYMENT},
+                lambda: BenefitConsumptionService(self.user).delete({'id': self.benefit.id}))
+
+        row = BenefitConsumption.objects.get(id=self.benefit.id)
+        self.assertEqual((row.status, row.json_ext), (BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, {}))
+        tasks.return_value.create.assert_not_called()
+        self.assertIsInstance(request.get('error'), ValueError)
+        self.assertTrue(waited, 'the request never waited for the sender')
+
+    def test_a_deletion_during_the_approval_of_a_pulled_payroll_waits_and_deletes_nothing(self):
+        """The payroll, whose agency pulls its list, is being approved when the
+        approved deletion task runs: the deletion waits for the approval,
+        then keeps the benefit and gives it back its status."""
+        Payroll.objects.filter(id=self.payroll.id).update(status=PayrollStatus.PENDING_APPROVAL)
+        BenefitConsumption.objects.filter(id=self.benefit.id).update(
+            status=BenefitConsumptionStatus.PENDING_DELETION,
+            json_ext={'pending_deletion': {'previous_status': BenefitConsumptionStatus.ACCEPTED}})
+        benefit = BenefitConsumption.objects.get(id=self.benefit.id)
+        with mock.patch('payroll.payments_registry.PaymentMethodStorage.get_chosen_payment_method',
+                        return_value=_TestPullStrategy):
+            waited, deletion = self._race(
+                Payroll, self.payroll.id, {'status': PayrollStatus.APPROVE_FOR_PAYMENT},
+                lambda: StrategyOfPaymentInterface.remove_benefit_from_payroll(benefit=benefit, user=self.user))
+
+        self.assertNotIn('error', deletion)
+        row = BenefitConsumption.objects.filter(id=self.benefit.id).first()
+        self.assertIsNotNone(row, 'the benefit was deleted')
+        self.assertEqual((row.is_deleted, row.status), (False, BenefitConsumptionStatus.ACCEPTED))
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll_id=self.payroll.id, benefit_id=self.benefit.id).exists())
+        self.assertFalse(deletion['value'])
+        self.assertTrue(waited, 'the deletion never waited for the approval')

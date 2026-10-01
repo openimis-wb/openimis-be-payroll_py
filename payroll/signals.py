@@ -102,7 +102,7 @@ def bind_service_signals():
 
     def on_task_delete_benefit(**kwargs):
         def delete_benefit(benefit, user):
-            StrategyOfPaymentInterface.remove_benefit_from_payroll(benefit=benefit)
+            StrategyOfPaymentInterface.remove_benefit_from_payroll(benefit=benefit, user=user)
         try:
             result = kwargs.get('result', None)
             task = result['data']['task']
