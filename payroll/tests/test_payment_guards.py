@@ -11,6 +11,11 @@
 - A benefit the gateway accepted whose save fails is logged at error level,
   marked ``unpersisted_push`` in a separate write and returned; the push
   goes on and the gateway task returns what the strategy reports.
+- Rejecting a payroll at approval keeps live and holds what an agency may
+  have paid; the deletion of a payroll holding such a benefit is refused.
+- The base online strategy reads a connector's dict result by its
+  ``success``, keeps a receipt the benefit holds, and logs a failed
+  reconciliation save at error level.
 """
 import uuid
 from contextlib import ExitStack, contextmanager
@@ -423,3 +428,173 @@ class RejectApprovedPayrollTest(_Fixtures):
         (payroll, user), kwargs = strategy.reject_approved_payroll.call_args
         self.assertEqual((payroll.id, list(kwargs)), (self.payroll.id, ['task_id']))
         self.assertEqual(str(kwargs['task_id']), str(task.id))
+
+
+class _RowsFixtures(_Fixtures):
+    """A payroll holding a reconciled benefit, one approved for payment, one
+    with a receipt and one waiting, each with a bill, a bill item and an
+    attachment."""
+
+    def _billed(self, status, payroll, receipt=None):
+        from invoice.models import Bill, BillItem
+        from payroll.models import BenefitAttachment
+
+        benefit = self._benefit(status, payroll)
+        if receipt:
+            BenefitConsumption.objects.filter(id=benefit.id).update(receipt=receipt)
+        bill = Bill(code=f'B-{uuid.uuid4().hex[:8]}', amount_total=72000, amount_net=72000)
+        bill.save(username=self.user.username)
+        BillItem(bill=bill, code=f'BI-{uuid.uuid4().hex[:8]}', amount_total=72000).save(
+            username=self.user.username)
+        BenefitAttachment(benefit=benefit, bill=bill).save(username=self.user.username)
+        return BenefitConsumption.objects.get(id=benefit.id), bill
+
+    def _rows(self, payroll):
+        self.reconciled, self.reconciled_bill = self._billed(
+            BenefitConsumptionStatus.RECONCILED, payroll, receipt='RCPT-1')
+        self.sent, _ = self._billed(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+        self.receipted, _ = self._billed(BenefitConsumptionStatus.ACCEPTED, payroll, receipt='IBB-2')
+        self.waiting, self.waiting_bill = self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+
+    def assertKept(self, benefit, status, receipt, stage):
+        from payroll.models import BenefitAttachment
+        row = BenefitConsumption.objects.get(id=benefit.id)
+        self.assertEqual((row.is_deleted, row.status, row.receipt), (False, status, receipt))
+        self.assertEqual(row.json_ext['rejection_hold']['stage'], stage)
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            benefit_id=benefit.id, is_deleted=False).exists())
+        self.assertTrue(BenefitAttachment.objects.filter(
+            benefit_id=benefit.id, is_deleted=False, bill__is_deleted=False).exists())
+
+    def assertRemoved(self, benefit, bill):
+        from invoice.models import Bill, BillItem
+        from payroll.models import BenefitAttachment
+        self.assertFalse(BenefitConsumption.objects.filter(id=benefit.id).exists())
+        self.assertTrue(BenefitConsumption.history.filter(id=benefit.id, history_type='-').exists())
+        self.assertFalse(PayrollBenefitConsumption.objects.filter(benefit_id=benefit.id).exists())
+        self.assertFalse(BenefitAttachment.objects.filter(benefit_id=benefit.id).exists())
+        self.assertFalse(Bill.objects.filter(id=bill.id).exists())
+        self.assertFalse(BillItem.objects.filter(bill_id=bill.id).exists())
+
+
+class RejectedPayrollKeepsRowsTest(_RowsFixtures):
+    """Rejecting a payroll at approval removes only what no agency may have
+    paid: the rest stays live and held."""
+
+    def test_an_offline_payroll_rejected_at_approval_keeps_its_rows(self):
+        from payroll.strategies import StrategyOfflinePayment
+
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        self._rows(payroll)
+
+        StrategyOfflinePayment.reject_payroll(payroll, self.user, task_id='T-9')
+
+        payroll.refresh_from_db()
+        self.assertEqual(payroll.status, PayrollStatus.REJECTED)
+        self.assertKept(self.reconciled, BenefitConsumptionStatus.RECONCILED, 'RCPT-1', 'payroll_rejected')
+        self.assertKept(self.sent, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, None, 'payroll_rejected')
+        self.assertKept(self.receipted, BenefitConsumptionStatus.ACCEPTED, 'IBB-2', 'payroll_rejected')
+        hold = BenefitConsumption.objects.get(id=self.reconciled.id).json_ext['rejection_hold']
+        self.assertEqual((hold['task_id'], hold['payroll_id'], hold['reason']),
+                         ('T-9', str(payroll.id), 'status RECONCILED'))
+        self.assertRemoved(self.waiting, self.waiting_bill)
+
+
+class PayrollDeletionTest(_RowsFixtures):
+    """An approved payroll deletion is refused for a payroll that holds a
+    benefit an agency may have paid."""
+
+    def _delete_through_task(self, payroll):
+        from payroll.strategies import StrategyOfflinePayment
+        from tasks_management.models import Task
+        from tasks_management.services import TaskService
+
+        PayrollService(self.user).delete({'id': payroll.id})
+        task = Task.objects.get(entity_id=str(payroll.id),
+                                business_event=PayrollConfig.payroll_delete_event)
+        with mock.patch('payroll.signals.PaymentMethodStorage.get_chosen_payment_method',
+                        return_value=StrategyOfflinePayment):
+            TaskService(self.user).complete_task({'id': task.id})
+
+    def test_a_payroll_nothing_was_paid_from_is_deleted(self):
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        waiting, bill = self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+
+        self._delete_through_task(payroll)
+
+        self.assertTrue(Payroll.objects.get(id=payroll.id).is_deleted)
+        self.assertRemoved(waiting, bill)
+
+    def test_a_payroll_holding_a_paid_benefit_is_not_deleted(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        self._rows(payroll)
+
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            self._delete_through_task(payroll)
+
+        self.assertFalse(Payroll.objects.get(id=payroll.id).is_deleted)
+        for benefit in (self.reconciled, self.sent, self.receipted, self.waiting):
+            row = BenefitConsumption.objects.get(id=benefit.id)
+            self.assertEqual((row.is_deleted, row.status), (False, benefit.status))
+            self.assertNotIn('rejection_hold', row.json_ext)
+        self.assertFalse(PayrollBenefitConsumption.objects.filter(
+            payroll=payroll, is_deleted=True).exists())
+
+
+class OnlineSendResultTest(_Fixtures):
+    """The base online strategy reads a connector's dict result by its
+    ``success``: a refused send is not marked APPROVE_FOR_PAYMENT."""
+
+    def _send(self, result):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        benefit = self._benefit(BenefitConsumptionStatus.ACCEPTED, payroll)
+        connector = mock.MagicMock()
+        connector.send_payment.return_value = result
+        with mock.patch.object(StrategyOnlinePayment, 'PAYMENT_GATEWAY', connector):
+            summary = StrategyOnlinePayment.make_payment_for_payroll(payroll, self.user)
+        benefit.refresh_from_db()
+        return benefit, summary
+
+    def test_a_refused_send_stays_accepted(self):
+        for result in ({'success': False, 'data': {'statusCode': '65200'}, 'error': 'declined'},
+                       {'success': False, 'data': None, 'error': 'timeout'}, False):
+            with self.subTest(result=result):
+                benefit, summary = self._send(result)
+                self.assertEqual(benefit.status, BenefitConsumptionStatus.ACCEPTED)
+                self.assertEqual(summary['succeeded'], 0)
+
+    def test_an_accepted_send_is_approved_for_payment(self):
+        for result in ({'success': True, 'data': {'statusCode': '200'}, 'error': None}, True):
+            with self.subTest(result=result):
+                benefit, summary = self._send(result)
+                self.assertEqual(benefit.status, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
+                self.assertEqual(summary['succeeded'], 1)
+
+
+class OnlineReconcileTest(_Fixtures):
+
+    def test_a_reconciled_benefit_keeps_its_receipt(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        with_receipt = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+        without = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+        BenefitConsumption.objects.filter(id=with_receipt.id).update(receipt='IBB-77')
+
+        StrategyOnlinePayment.reconcile_benefit_consumption(
+            list(BenefitConsumption.objects.filter(id__in=[with_receipt.id, without.id])), self.user)
+
+        with_receipt.refresh_from_db()
+        without.refresh_from_db()
+        self.assertEqual((with_receipt.status, with_receipt.receipt),
+                         (BenefitConsumptionStatus.RECONCILED, 'IBB-77'))
+        self.assertEqual(without.status, BenefitConsumptionStatus.RECONCILED)
+        self.assertTrue(without.receipt)
+
+    def test_a_failed_save_is_logged_at_error_level(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        benefit = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+
+        with mock.patch.object(BenefitConsumption, 'save', side_effect=RuntimeError('database unavailable')), \
+                self.assertLogs('payroll.strategies.strategy_online_payment', 'ERROR') as logs:
+            StrategyOnlinePayment.reconcile_benefit_consumption([benefit], self.user)
+
+        self.assertTrue(any(benefit.code in line for line in logs.output))
