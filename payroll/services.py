@@ -573,6 +573,69 @@ def open_payroll_statuses():
     )
 
 
+def status_before_deletion_request(benefit):
+    """The status a PENDING_DELETION benefit had when its deletion was
+    requested: ``json_ext.pending_deletion``, else its last history row that
+    is not PENDING_DELETION; None when neither tells."""
+    json_ext = benefit.json_ext if isinstance(benefit.json_ext, dict) else {}
+    marker = json_ext.get(PENDING_DELETION_KEY)
+    previous = marker.get('previous_status') if isinstance(marker, dict) else None
+    if not previous:
+        row = (benefit.history
+               .exclude(status=BenefitConsumptionStatus.PENDING_DELETION)
+               .order_by('-history_date')
+               .first())
+        previous = row.status if row else None
+    if previous == BenefitConsumptionStatus.PENDING_DELETION:
+        return None
+    return previous
+
+
+def lock_benefit_for_deletion(benefit_id):
+    """Lock a benefit for its deletion and say why it may not be deleted.
+
+    Call inside ``transaction.atomic``. Locks the payrolls the benefit is
+    linked to (ordered by id), then the benefit row: the order every payroll
+    deletion and rejection takes. Returns ``(benefit, refusal)``: the locked
+    row, or None when it does not exist or is deleted, and None or the reason
+    it is kept. It is kept when its links changed while they were locked,
+    when one of its payrolls may have been paid from as a whole, or when it
+    may have been paid itself; both read by each payroll's strategy
+    (``payroll_paid_reason``, ``sent_benefit_reasons``), on the status the
+    benefit had before a pending deletion request.
+    """
+    import copy
+
+    def linked_payroll_ids():
+        return sorted(set(PayrollBenefitConsumption.objects
+                          .filter(benefit_id=benefit_id, is_deleted=False)
+                          .values_list('payroll_id', flat=True)))
+
+    payroll_ids = linked_payroll_ids()
+    payrolls = list(Payroll.objects.select_for_update().filter(id__in=payroll_ids).order_by('id'))
+    benefit = BenefitConsumption.objects.select_for_update().filter(id=benefit_id).first()
+    if benefit is None or benefit.is_deleted:
+        return None, None
+    if linked_payroll_ids() != payroll_ids:
+        return benefit, 'its payroll links changed while they were being locked'
+
+    probe = copy.copy(benefit)
+    if benefit.status == BenefitConsumptionStatus.PENDING_DELETION:
+        probe.status = status_before_deletion_request(benefit) or benefit.status
+    from payroll.strategies import StrategyOfPaymentInterface
+    strategies = [(payroll, PayrollService._strategy(payroll)) for payroll in payrolls] \
+        or [(None, StrategyOfPaymentInterface)]
+    reasons = []
+    for payroll, strategy in strategies:
+        paid = strategy.payroll_paid_reason(payroll) if payroll is not None else None
+        if paid:
+            reasons.append(f'payroll {payroll.id}: {paid}')
+        sent = strategy.sent_benefit_reasons([probe]).get(benefit.id)
+        if sent and sent not in reasons:
+            reasons.append(sent)
+    return benefit, '; '.join(reasons) or None
+
+
 def restore_benefit_after_refused_deletion(benefit, user):
     """Give a benefit whose deletion was refused back the status it had.
 
@@ -592,15 +655,8 @@ def restore_benefit_after_refused_deletion(benefit, user):
     if benefit.status != BenefitConsumptionStatus.PENDING_DELETION:
         return None
     json_ext = dict(benefit.json_ext) if isinstance(benefit.json_ext, dict) else {}
-    marker = json_ext.get(PENDING_DELETION_KEY)
-    previous = marker.get('previous_status') if isinstance(marker, dict) else None
+    previous = status_before_deletion_request(benefit)
     if not previous:
-        row = (benefit.history
-               .exclude(status=BenefitConsumptionStatus.PENDING_DELETION)
-               .order_by('-history_date')
-               .first())
-        previous = row.status if row else None
-    if not previous or previous == BenefitConsumptionStatus.PENDING_DELETION:
         logger.error(
             "Deletion of benefit %s refused, but its status before the request is unknown; "
             "it stays %s.", benefit.id, BenefitConsumptionStatus.PENDING_DELETION,
@@ -641,22 +697,36 @@ class BenefitConsumptionService(BaseService):
     @check_authentication
     @register_service_signal('benefit_consumption_service.delete')
     def delete(self, obj_data):
-        benefit_to_delete = BenefitConsumption.objects.get(id=obj_data['id'])
-        if benefit_to_delete.status != BenefitConsumptionStatus.PENDING_DELETION:
-            json_ext = dict(benefit_to_delete.json_ext) if isinstance(benefit_to_delete.json_ext, dict) else {}
-            json_ext[PENDING_DELETION_KEY] = {'previous_status': benefit_to_delete.status}
-            benefit_to_delete.json_ext = json_ext
-        benefit_to_delete.status = BenefitConsumptionStatus.PENDING_DELETION
-        benefit_to_delete.save(user=self.user)
-        data = {'id': benefit_to_delete.id}
-        TaskService(self.user).create({
-            'source': 'benefit_delete',
-            'entity': benefit_to_delete,
-            'status': Task.Status.RECEIVED,
-            'executor_action_event': TasksManagementConfig.default_executor_event,
-            'business_event': PayrollConfig.benefit_delete_event,
-            'data': _get_std_task_data_payload(data)
-        })
+        """Create the deletion task of a benefit.
+
+        Under the locks of ``lock_benefit_for_deletion``, a benefit that does
+        not exist, is deleted, or is kept by that check is refused
+        (ValueError): its status is left as it is and no task is created.
+        Otherwise it becomes PENDING_DELETION, its status before the request
+        in ``json_ext.pending_deletion``. The approved task checks again
+        (``remove_benefit_from_payroll``).
+        """
+        with transaction.atomic():
+            benefit_to_delete, refusal = lock_benefit_for_deletion(obj_data['id'])
+            if benefit_to_delete is None:
+                raise ValueError(f"Benefit {obj_data['id']} does not exist or is deleted.")
+            if refusal:
+                raise ValueError(f"Benefit {benefit_to_delete.id} is not deleted: {refusal}.")
+            if benefit_to_delete.status != BenefitConsumptionStatus.PENDING_DELETION:
+                json_ext = dict(benefit_to_delete.json_ext) if isinstance(benefit_to_delete.json_ext, dict) else {}
+                json_ext[PENDING_DELETION_KEY] = {'previous_status': benefit_to_delete.status}
+                benefit_to_delete.json_ext = json_ext
+            benefit_to_delete.status = BenefitConsumptionStatus.PENDING_DELETION
+            benefit_to_delete.save(user=self.user)
+            data = {'id': benefit_to_delete.id}
+            TaskService(self.user).create({
+                'source': 'benefit_delete',
+                'entity': benefit_to_delete,
+                'status': Task.Status.RECEIVED,
+                'executor_action_event': TasksManagementConfig.default_executor_event,
+                'business_event': PayrollConfig.benefit_delete_event,
+                'data': _get_std_task_data_payload(data)
+            })
 
     @check_authentication
     @register_service_signal('benefit_consumption_service.create_or_update_benefit_attachment')
