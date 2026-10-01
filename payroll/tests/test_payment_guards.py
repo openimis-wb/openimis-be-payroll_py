@@ -573,11 +573,63 @@ class PayrollDeletionTest(_RowsFixtures):
                 payroll=payroll, benefit_id=benefit.id, is_deleted=False).exists())
 
 
+class _TestPullStrategy(StrategyOnlinePayment):
+    """An online strategy whose agency pulls its list: no gateway."""
+    LIST_PULLED_BY_AGENCY = True
+
+    @classmethod
+    def initialize_payment_gateway(cls, payment_point=None):
+        cls.PAYMENT_GATEWAY = None
+
+
+class PulledPayrollDeletionTaskTest(_RowsFixtures):
+    """Under lock, the approved deletion task reads the payroll itself: a
+    payroll already deleted, or approved with a list its agency pulls, is
+    left as it is."""
+
+    def test_an_approved_pulled_payroll_is_not_deleted(self):
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        waiting, bill = self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+        Payroll.objects.filter(id=payroll.id).update(status=PayrollStatus.APPROVE_FOR_PAYMENT)
+
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            deleted = _TestPullStrategy.delete_payroll(Payroll.objects.get(id=payroll.id), self.user)
+
+        self.assertFalse(deleted)
+        self.assertFalse(Payroll.objects.get(id=payroll.id).is_deleted)
+        row = BenefitConsumption.objects.get(id=waiting.id)
+        self.assertEqual((row.is_deleted, row.status), (False, BenefitConsumptionStatus.ACCEPTED))
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=payroll, benefit_id=waiting.id, is_deleted=False).exists())
+
+    def test_a_second_approved_deletion_changes_nothing(self):
+        from payroll.strategies import StrategyOfflinePayment
+
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+        self.assertTrue(StrategyOfflinePayment.delete_payroll(payroll, self.user))
+        versions = Payroll.history.filter(id=payroll.id).count()
+
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            self.assertFalse(StrategyOfflinePayment.delete_payroll(payroll, self.user))
+        self.assertEqual(Payroll.history.filter(id=payroll.id).count(), versions)
+
+    def test_a_deleted_payroll_is_not_put_up_for_deletion(self):
+        from tasks_management.models import Task
+
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        Payroll.objects.filter(id=payroll.id).update(is_deleted=True)
+        with self.assertRaises(ValueError):
+            PayrollService(self.user).delete({'id': payroll.id})
+        self.assertFalse(Task.objects.filter(
+            entity_id=str(payroll.id), business_event=PayrollConfig.payroll_delete_event).exists())
+
+
 class PayrollDeletionRequestTest(_RowsFixtures):
-    """A payroll an agency may have been paid from (APPROVE_FOR_PAYMENT and
-    any status but GENERATING, PENDING_VERIFICATION, PENDING_APPROVAL and
-    FAILED) is not put up for deletion unless none of its benefits may have
-    been paid."""
+    """A payroll in any status but GENERATING, PENDING_VERIFICATION,
+    PENDING_APPROVAL and FAILED is not put up for deletion unless none of its
+    benefits may have been paid; an approved payroll whose agency pulls its
+    list is not put up for deletion at all."""
 
     def _deletion_tasks(self, payroll):
         from tasks_management.models import Task
@@ -595,11 +647,19 @@ class PayrollDeletionRequestTest(_RowsFixtures):
                     PayrollService(self.user).delete({'id': payroll.id})
                 self.assertFalse(self._deletion_tasks(payroll).exists())
 
-    def test_an_approved_payroll_nothing_was_sent_from_is_put_up_for_deletion(self):
-        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
-        self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
-        PayrollService(self.user).delete({'id': payroll.id})
-        self.assertEqual(self._deletion_tasks(payroll).count(), 1)
+    def test_an_approved_payroll_whose_agency_pulls_its_list_is_refused(self):
+        """The rows of a payroll its agency pulls show nothing of the pull:
+        once approved, it is not put up for deletion even when none of its
+        rows shows a payment."""
+        for status in (PayrollStatus.APPROVE_FOR_PAYMENT, PayrollStatus.RECONCILED):
+            with self.subTest(payroll_status=status):
+                payroll = self._payroll(status)
+                self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+                with mock.patch('payroll.payments_registry.PaymentMethodStorage.get_chosen_payment_method',
+                                return_value=_TestPullStrategy), \
+                        self.assertRaises(ValueError):
+                    PayrollService(self.user).delete({'id': payroll.id})
+                self.assertFalse(self._deletion_tasks(payroll).exists())
 
     def test_a_payroll_not_yet_approved_is_put_up_for_deletion(self):
         for status in (PayrollStatus.PENDING_APPROVAL, 'PENDING_VERIFICATION',
@@ -668,14 +728,6 @@ class OnlineReconcileTest(_Fixtures):
             StrategyOnlinePayment.reconcile_benefit_consumption([benefit], self.user)
 
         self.assertTrue(any(benefit.code in line for line in logs.output))
-
-
-class _TestPullStrategy(StrategyOnlinePayment):
-    """An online strategy whose agency pulls its list: no gateway."""
-
-    @classmethod
-    def initialize_payment_gateway(cls, payment_point=None):
-        cls.PAYMENT_GATEWAY = None
 
 
 class ReconcileTaskStrategyTest(_Fixtures):
