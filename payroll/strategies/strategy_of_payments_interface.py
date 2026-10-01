@@ -9,6 +9,11 @@ REJECTION_HOLD_KEY = 'rejection_hold'
 
 class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
 
+    # True for a strategy whose agency pulls the payroll's payment list: the
+    # rows show nothing of a pull, so the payroll as a whole may have been
+    # paid from once it has been approved (``payroll_paid_reason``).
+    LIST_PULLED_BY_AGENCY = False
+
     @classmethod
     def initialize_payment_gateway(cls, payment_point=None):
         pass
@@ -112,15 +117,28 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
         return reasons
 
     @classmethod
+    def payroll_paid_reason(cls, payroll):
+        """Why an agency may have paid from the payroll as a whole, whatever
+        its rows show, or None: the payroll of a strategy whose agency pulls
+        its list (``LIST_PULLED_BY_AGENCY``) once it is APPROVE_FOR_PAYMENT
+        or RECONCILED."""
+        from payroll.models import PayrollStatus
+        if cls.LIST_PULLED_BY_AGENCY and payroll.status in (
+                PayrollStatus.APPROVE_FOR_PAYMENT, PayrollStatus.RECONCILED):
+            return f'payroll {payroll.status}: its agency pulls its payment list'
+        return None
+
+    @classmethod
     def delete_payroll(cls, payroll, user, **kwargs):
         """Delete a payroll whose deletion task was approved; True when deleted.
 
         Runs in one transaction holding the payroll row and its benefit rows
-        (``remove_benefits_from_rejected_payroll``). A payroll holding a
-        benefit an agency may have paid (``sent_benefit_reasons``, read on
-        the locked rows) is not deleted: the refusal is logged and nothing
-        changes. Otherwise its benefits are removed and the payroll is
-        deleted.
+        (``remove_benefits_from_rejected_payroll``). A payroll already
+        deleted, one an agency may have paid from as a whole
+        (``payroll_paid_reason``), or one holding a benefit an agency may
+        have paid (``sent_benefit_reasons``, read on the locked rows) is not
+        deleted: the refusal is logged and nothing changes. Otherwise its
+        benefits are removed and the payroll is deleted.
         """
         from django.db import transaction
         from payroll.models import Payroll
@@ -128,6 +146,14 @@ class StrategyOfPaymentInterface(object, metaclass=abc.ABCMeta):
 
         with transaction.atomic():
             payroll = Payroll.objects.select_for_update().get(id=payroll.id)
+            if payroll.is_deleted:
+                logger.error("Deletion of payroll %s refused: it is already deleted; nothing was done.",
+                             payroll.id)
+                return False
+            paid = cls.payroll_paid_reason(payroll)
+            if paid:
+                logger.error("Deletion of payroll %s refused: %s; nothing was deleted.", payroll.id, paid)
+                return False
             held = cls.remove_benefits_from_rejected_payroll(
                 payroll, user=user, stage='payroll_deleted', task_id=kwargs.get('task_id'),
                 refuse_if_held=True)
