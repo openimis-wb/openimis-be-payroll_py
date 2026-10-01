@@ -7,7 +7,6 @@ from payroll.models import (
     PayrollStatus,
     BenefitConsumptionStatus,
 )
-from payroll.strategies import StrategyOnlinePayment
 from payroll.payments_registry import PaymentMethodStorage
 
 logger = logging.getLogger(__name__)
@@ -49,13 +48,24 @@ def send_requests_to_gateway_payment(payroll_id, user_id):
 
 @shared_task
 def send_request_to_reconcile(payroll_id, user_id):
+    """Close a payroll through its own strategy: it becomes RECONCILED and the
+    strategy's gateway is asked about each APPROVE_FOR_PAYMENT benefit. A
+    strategy that leaves ``PAYMENT_GATEWAY`` None (an agency that pulls its
+    list) closes the payroll without asking any gateway. A payroll whose
+    strategy is not registered is left as it is."""
     payroll = Payroll.objects.get(id=payroll_id)
     user = User.objects.get(id=user_id)
-    strategy = StrategyOnlinePayment
+    strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
+    if not strategy:
+        logger.error("Closing of payroll %s refused: no registered payment strategy %r.",
+                     payroll_id, payroll.payment_method)
+        return
     strategy.initialize_payment_gateway(payroll.payment_point)
     strategy.change_status_of_payroll(payroll, PayrollStatus.RECONCILED, user)
+    payment_gateway_connector = getattr(strategy, 'PAYMENT_GATEWAY', None)
+    if payment_gateway_connector is None:
+        return
     benefits = strategy.get_benefits_attached_to_payroll(payroll, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
-    payment_gateway_connector = strategy.PAYMENT_GATEWAY
     benefits_to_reconcile = []
     for benefit in benefits:
         is_reconciled = payment_gateway_connector.reconcile(benefit.code, benefit.amount)

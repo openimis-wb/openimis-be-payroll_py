@@ -23,7 +23,7 @@ from datetime import date
 from unittest import mock
 
 import pandas as pd
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 
 from core.signals import REGISTERED_SERVICE_SIGNALS
 from core.test_helpers import LogInHelper
@@ -504,7 +504,10 @@ class PayrollDeletionTest(_RowsFixtures):
     """An approved payroll deletion is refused for a payroll that holds a
     benefit an agency may have paid."""
 
-    def _delete_through_task(self, payroll):
+    def _delete_through_task(self, payroll, status_at_completion=None):
+        """Request the deletion, then complete its task; with
+        ``status_at_completion``, the payroll reaches that status between
+        the request and the completion."""
         from payroll.strategies import StrategyOfflinePayment
         from tasks_management.models import Task
         from tasks_management.services import TaskService
@@ -512,6 +515,8 @@ class PayrollDeletionTest(_RowsFixtures):
         PayrollService(self.user).delete({'id': payroll.id})
         task = Task.objects.get(entity_id=str(payroll.id),
                                 business_event=PayrollConfig.payroll_delete_event)
+        if status_at_completion:
+            Payroll.objects.filter(id=payroll.id).update(status=status_at_completion)
         with mock.patch('payroll.signals.PaymentMethodStorage.get_chosen_payment_method',
                         return_value=StrategyOfflinePayment):
             TaskService(self.user).complete_task({'id': task.id})
@@ -526,11 +531,11 @@ class PayrollDeletionTest(_RowsFixtures):
         self.assertRemoved(waiting, bill)
 
     def test_a_payroll_holding_a_paid_benefit_is_not_deleted(self):
-        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
         self._rows(payroll)
 
         with self.assertLogs('payroll.strategies', level='ERROR'):
-            self._delete_through_task(payroll)
+            self._delete_through_task(payroll, status_at_completion=PayrollStatus.APPROVE_FOR_PAYMENT)
 
         self.assertFalse(Payroll.objects.get(id=payroll.id).is_deleted)
         for benefit in (self.reconciled, self.sent, self.receipted, self.waiting):
@@ -539,6 +544,131 @@ class PayrollDeletionTest(_RowsFixtures):
             self.assertNotIn('rejection_hold', row.json_ext)
         self.assertFalse(PayrollBenefitConsumption.objects.filter(
             payroll=payroll, is_deleted=True).exists())
+
+    def test_a_benefit_held_at_removal_stops_the_deletion(self):
+        """The removal's own reading of the rows decides: a benefit it finds
+        possibly paid stops the deletion, whatever an earlier reading said."""
+        import sys
+        from payroll.strategies import StrategyOfflinePayment
+
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        waiting, _ = self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+        other, _ = self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+
+        def reasons(cls, benefits):
+            if sys._getframe(1).f_code.co_name != 'remove_benefits_from_rejected_payroll':
+                return {}
+            return {benefit.id: 'push attempt' for benefit in benefits if benefit.id == waiting.id}
+
+        with mock.patch.object(StrategyOfflinePayment, 'sent_benefit_reasons', classmethod(reasons)), \
+                self.assertLogs('payroll.strategies', level='ERROR'):
+            deleted = StrategyOfflinePayment.delete_payroll(payroll, self.user)
+
+        self.assertFalse(deleted)
+        self.assertFalse(Payroll.objects.get(id=payroll.id).is_deleted)
+        for benefit in (waiting, other):
+            row = BenefitConsumption.objects.get(id=benefit.id)
+            self.assertEqual((row.is_deleted, row.status), (False, BenefitConsumptionStatus.ACCEPTED))
+            self.assertTrue(PayrollBenefitConsumption.objects.filter(
+                payroll=payroll, benefit_id=benefit.id, is_deleted=False).exists())
+
+
+class _TestPullStrategy(StrategyOnlinePayment):
+    """An online strategy whose agency pulls its list: no gateway."""
+    LIST_PULLED_BY_AGENCY = True
+
+    @classmethod
+    def initialize_payment_gateway(cls, payment_point=None):
+        cls.PAYMENT_GATEWAY = None
+
+
+class PulledPayrollDeletionTaskTest(_RowsFixtures):
+    """Under lock, the approved deletion task reads the payroll itself: a
+    payroll already deleted, or approved with a list its agency pulls, is
+    left as it is."""
+
+    def test_an_approved_pulled_payroll_is_not_deleted(self):
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        waiting, bill = self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+        Payroll.objects.filter(id=payroll.id).update(status=PayrollStatus.APPROVE_FOR_PAYMENT)
+
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            deleted = _TestPullStrategy.delete_payroll(Payroll.objects.get(id=payroll.id), self.user)
+
+        self.assertFalse(deleted)
+        self.assertFalse(Payroll.objects.get(id=payroll.id).is_deleted)
+        row = BenefitConsumption.objects.get(id=waiting.id)
+        self.assertEqual((row.is_deleted, row.status), (False, BenefitConsumptionStatus.ACCEPTED))
+        self.assertTrue(PayrollBenefitConsumption.objects.filter(
+            payroll=payroll, benefit_id=waiting.id, is_deleted=False).exists())
+
+    def test_a_second_approved_deletion_changes_nothing(self):
+        from payroll.strategies import StrategyOfflinePayment
+
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+        self.assertTrue(StrategyOfflinePayment.delete_payroll(payroll, self.user))
+        versions = Payroll.history.filter(id=payroll.id).count()
+
+        with self.assertLogs('payroll.strategies', level='ERROR'):
+            self.assertFalse(StrategyOfflinePayment.delete_payroll(payroll, self.user))
+        self.assertEqual(Payroll.history.filter(id=payroll.id).count(), versions)
+
+    def test_a_deleted_payroll_is_not_put_up_for_deletion(self):
+        from tasks_management.models import Task
+
+        payroll = self._payroll(PayrollStatus.PENDING_APPROVAL)
+        Payroll.objects.filter(id=payroll.id).update(is_deleted=True)
+        with self.assertRaises(ValueError):
+            PayrollService(self.user).delete({'id': payroll.id})
+        self.assertFalse(Task.objects.filter(
+            entity_id=str(payroll.id), business_event=PayrollConfig.payroll_delete_event).exists())
+
+
+class PayrollDeletionRequestTest(_RowsFixtures):
+    """A payroll in any status but GENERATING, PENDING_VERIFICATION,
+    PENDING_APPROVAL and FAILED is not put up for deletion unless none of its
+    benefits may have been paid; an approved payroll whose agency pulls its
+    list is not put up for deletion at all."""
+
+    def _deletion_tasks(self, payroll):
+        from tasks_management.models import Task
+        return Task.objects.filter(entity_id=str(payroll.id),
+                                   business_event=PayrollConfig.payroll_delete_event)
+
+    def test_a_payroll_holding_a_sent_benefit_is_refused_once_approved(self):
+        for status in (PayrollStatus.APPROVE_FOR_PAYMENT, PayrollStatus.RECONCILED,
+                       PayrollStatus.REJECTED):
+            with self.subTest(payroll_status=status):
+                payroll = self._payroll(status)
+                self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+                self._billed(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+                with self.assertRaises(ValueError):
+                    PayrollService(self.user).delete({'id': payroll.id})
+                self.assertFalse(self._deletion_tasks(payroll).exists())
+
+    def test_an_approved_payroll_whose_agency_pulls_its_list_is_refused(self):
+        """The rows of a payroll its agency pulls show nothing of the pull:
+        once approved, it is not put up for deletion even when none of its
+        rows shows a payment."""
+        for status in (PayrollStatus.APPROVE_FOR_PAYMENT, PayrollStatus.RECONCILED):
+            with self.subTest(payroll_status=status):
+                payroll = self._payroll(status)
+                self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+                with mock.patch('payroll.payments_registry.PaymentMethodStorage.get_chosen_payment_method',
+                                return_value=_TestPullStrategy), \
+                        self.assertRaises(ValueError):
+                    PayrollService(self.user).delete({'id': payroll.id})
+                self.assertFalse(self._deletion_tasks(payroll).exists())
+
+    def test_a_payroll_not_yet_approved_is_put_up_for_deletion(self):
+        for status in (PayrollStatus.PENDING_APPROVAL, 'PENDING_VERIFICATION',
+                       PayrollStatus.GENERATING, PayrollStatus.FAILED):
+            with self.subTest(payroll_status=status):
+                payroll = self._payroll(status)
+                self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
+                PayrollService(self.user).delete({'id': payroll.id})
+                self.assertEqual(self._deletion_tasks(payroll).count(), 1)
 
 
 class OnlineSendResultTest(_Fixtures):
@@ -598,3 +728,218 @@ class OnlineReconcileTest(_Fixtures):
             StrategyOnlinePayment.reconcile_benefit_consumption([benefit], self.user)
 
         self.assertTrue(any(benefit.code in line for line in logs.output))
+
+
+class ReconcileTaskStrategyTest(_Fixtures):
+    """The closing task runs the payroll's own strategy: a strategy without a
+    gateway closes the payroll without asking any gateway what it paid."""
+
+    def _close(self, payroll, strategy):
+        from payroll.tasks import send_request_to_reconcile
+        with mock.patch('payroll.tasks.PaymentMethodStorage.get_chosen_payment_method',
+                        return_value=strategy), \
+                mock.patch('payroll.payment_gateway.PaymentGatewayConfig') as config:
+            send_request_to_reconcile(str(payroll.id), str(self.user.id))
+        return config
+
+    def test_a_payroll_without_a_gateway_is_closed_without_a_lookup(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        benefit = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll,
+                                json_ext={'payment_provider': {'acknowledgment_status': 'ACCEPTED'}})
+
+        config = self._close(payroll, _TestPullStrategy)
+
+        config.assert_not_called()
+        self.assertEqual(Payroll.objects.get(id=payroll.id).status, PayrollStatus.RECONCILED)
+        row = BenefitConsumption.objects.get(id=benefit.id)
+        self.assertEqual((row.status, row.receipt, row.json_ext),
+                         (BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, None,
+                          {'payment_provider': {'acknowledgment_status': 'ACCEPTED'}}))
+
+    def test_a_payroll_with_a_gateway_is_looked_up_through_its_strategy(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        benefit = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+        connector = mock.MagicMock()
+        connector.reconcile.return_value = True
+
+        class Strategy(StrategyOnlinePayment):
+            @classmethod
+            def initialize_payment_gateway(cls, payment_point=None):
+                cls.PAYMENT_GATEWAY = connector
+
+        config = self._close(payroll, Strategy)
+
+        config.assert_not_called()
+        connector.reconcile.assert_called_once_with(benefit.code, benefit.amount)
+        self.assertEqual(Payroll.objects.get(id=payroll.id).status, PayrollStatus.RECONCILED)
+        self.assertEqual(BenefitConsumption.objects.get(id=benefit.id).status,
+                         BenefitConsumptionStatus.RECONCILED)
+
+    def test_a_payroll_without_a_registered_strategy_is_left_as_it_is(self):
+        payroll = self._payroll(PayrollStatus.APPROVE_FOR_PAYMENT)
+        benefit = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+
+        with self.assertLogs('payroll.tasks', level='ERROR'):
+            config = self._close(payroll, None)
+
+        config.assert_not_called()
+        self.assertEqual(Payroll.objects.get(id=payroll.id).status, PayrollStatus.APPROVE_FOR_PAYMENT)
+        self.assertEqual(BenefitConsumption.objects.get(id=benefit.id).status,
+                         BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
+
+
+class PayrollDeletionRaceTest(SimpleTestCase):
+    """The deletion of a payroll and a send of its benefits, in two committed
+    transactions. A sender claims its rows with ``SKIP LOCKED`` and marks
+    them sent (APPROVE_FOR_PAYMENT) before it commits: the deletion either
+    removes rows no sender can take any more, or finds them sent and deletes
+    nothing.
+
+    Runs outside a test transaction, so each thread sees the other's
+    commits; the rows it creates are removed in ``tearDown``.
+    """
+    databases = {'default'}
+    WAIT = 20
+
+    def setUp(self):
+        self.user = LogInHelper().get_or_create_user_api(username='payroll_race_user')
+        self.individual = Individual(first_name='Course', last_name='Paiement', dob='1990-01-01')
+        self.individual.save(username=self.user.username)
+        self.payroll = Payroll(name=f'RACE-{uuid.uuid4().hex[:6]}', status=PayrollStatus.APPROVE_FOR_PAYMENT,
+                               payment_method='StrategyGuardTest', json_ext={})
+        self.payroll.save(username=self.user.username)
+        self.benefits = []
+        for _ in range(3):
+            benefit = BenefitConsumption(
+                individual=self.individual, code=f'RACE-{uuid.uuid4().hex[:8]}', amount=72000,
+                type='Cash Transfer', status=BenefitConsumptionStatus.ACCEPTED,
+                date_due=date(2026, 10, 1), json_ext={})
+            benefit.save(username=self.user.username)
+            PayrollBenefitConsumption(payroll=self.payroll, benefit=benefit).save(
+                username=self.user.username)
+            self.benefits.append(benefit)
+        self.ids = [benefit.id for benefit in self.benefits]
+
+    def tearDown(self):
+        PayrollBenefitConsumption.objects.filter(payroll_id=self.payroll.id).delete()
+        BenefitConsumption.objects.filter(id__in=self.ids).delete()
+        Payroll.objects.filter(id=self.payroll.id).delete()
+        Individual.objects.filter(id=self.individual.id).delete()
+
+    def _claim(self, on_locked=None):
+        """A sender's claim: lock the ACCEPTED rows it can take, mark them
+        sent, commit. Returns the ids it took."""
+        from django.db import transaction
+        with transaction.atomic():
+            rows = list(BenefitConsumption.objects.select_for_update(skip_locked=True)
+                        .filter(id__in=self.ids, status=BenefitConsumptionStatus.ACCEPTED,
+                                is_deleted=False).order_by('id'))
+            if on_locked:
+                on_locked()
+            BenefitConsumption.objects.filter(id__in=[row.id for row in rows]).update(
+                status=BenefitConsumptionStatus.APPROVE_FOR_PAYMENT)
+        return [row.id for row in rows]
+
+    def _in_thread(self, target, result, started=None):
+        import threading
+        from django.db import connection
+
+        def run():
+            try:
+                with connection.cursor() as cursor:
+                    cursor.execute("SET lock_timeout = '%ss'" % self.WAIT)
+                    cursor.execute('SELECT pg_backend_pid()')
+                    result['pid'] = cursor.fetchone()[0]
+                if started:
+                    started.set()
+                result['value'] = target()
+            except Exception as error:
+                result['error'] = error
+            finally:
+                connection.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread
+
+    def _wait_for_lock(self, pid):
+        """True once the backend ``pid`` waits on a lock."""
+        import time
+        from django.db import connection
+        deadline = time.monotonic() + self.WAIT
+        while time.monotonic() < deadline:
+            with connection.cursor() as cursor:
+                cursor.execute('SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s', [pid])
+                row = cursor.fetchone()
+            if row and row[0] == 'Lock':
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_a_claim_during_the_deletion_takes_nothing(self):
+        """The sender claims while the deletion has read the rows and not yet
+        deleted them: it takes none, and the deletion removes them all."""
+        import sys
+        import threading
+        from payroll.strategies import StrategyOfflinePayment
+
+        checked, resume = threading.Event(), threading.Event()
+        real = StrategyOfflinePayment.sent_benefit_reasons.__func__
+
+        def reasons(cls, benefits):
+            found = real(cls, benefits)
+            if sys._getframe(1).f_code.co_name == 'remove_benefits_from_rejected_payroll':
+                checked.set()
+                resume.wait(self.WAIT)
+            return found
+
+        deletion = {}
+        with mock.patch.object(StrategyOfflinePayment, 'sent_benefit_reasons', classmethod(reasons)):
+            thread = self._in_thread(
+                lambda: StrategyOfflinePayment.delete_payroll(self.payroll, self.user), deletion)
+            self.assertTrue(checked.wait(self.WAIT), 'the deletion never read its rows')
+            try:
+                claimed = self._claim()
+            finally:
+                resume.set()
+                thread.join(self.WAIT)
+
+        self.assertNotIn('error', deletion)
+        self.assertEqual(claimed, [])
+        self.assertTrue(deletion['value'])
+        self.assertFalse(BenefitConsumption.objects.filter(id__in=self.ids).exists())
+        self.assertTrue(Payroll.objects.get(id=self.payroll.id).is_deleted)
+
+    def test_a_deletion_during_a_claim_waits_and_deletes_nothing(self):
+        """The deletion starts while a sender holds the rows: it waits for the
+        sender's commit, then finds them sent and deletes nothing."""
+        import threading
+        from payroll.strategies import StrategyOfflinePayment
+
+        locked, release, started = threading.Event(), threading.Event(), threading.Event()
+
+        def on_locked():
+            locked.set()
+            release.wait(self.WAIT)
+
+        claim, deletion = {}, {}
+        claimer = self._in_thread(lambda: self._claim(on_locked), claim)
+        self.assertTrue(locked.wait(self.WAIT), 'the sender never locked its rows')
+        deleter = self._in_thread(
+            lambda: StrategyOfflinePayment.delete_payroll(self.payroll, self.user), deletion, started)
+        try:
+            waited = started.wait(self.WAIT) and self._wait_for_lock(deletion['pid'])
+        finally:
+            release.set()
+            claimer.join(self.WAIT)
+            deleter.join(self.WAIT)
+
+        self.assertNotIn('error', claim)
+        self.assertNotIn('error', deletion)
+        self.assertTrue(waited, 'the deletion never waited for the sender')
+        self.assertEqual(sorted(claim['value']), sorted(self.ids))
+        self.assertFalse(deletion['value'])
+        self.assertEqual(
+            sorted(BenefitConsumption.objects.filter(id__in=self.ids).values_list('status', flat=True)),
+            [BenefitConsumptionStatus.APPROVE_FOR_PAYMENT] * 3)
+        self.assertFalse(Payroll.objects.get(id=self.payroll.id).is_deleted)
