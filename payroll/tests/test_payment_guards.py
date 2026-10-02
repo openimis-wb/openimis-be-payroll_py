@@ -177,6 +177,7 @@ class RefusedDeletionTest(_Fixtures):
                 self.assertEqual(benefit.status, status)
                 self.assertNotIn('pending_deletion', benefit.json_ext)
 
+    @mock.patch.object(PayrollConfig, 'pre_approval_payroll_statuses', ['PENDING_VERIFICATION'])
     def test_a_payable_status_comes_back_in_a_live_payroll_not_yet_closed(self):
         for payroll_status in ('PENDING_VERIFICATION', PayrollStatus.PENDING_APPROVAL,
                                PayrollStatus.APPROVE_FOR_PAYMENT):
@@ -626,7 +627,7 @@ class PulledPayrollDeletionTaskTest(_RowsFixtures):
 
 
 class PayrollDeletionRequestTest(_RowsFixtures):
-    """A payroll in any status but GENERATING, PENDING_VERIFICATION,
+    """A payroll in any status but GENERATING, a declared pre-approval status,
     PENDING_APPROVAL and FAILED is not put up for deletion unless none of its
     benefits may have been paid; an approved payroll whose agency pulls its
     list is not put up for deletion at all."""
@@ -661,6 +662,7 @@ class PayrollDeletionRequestTest(_RowsFixtures):
                     PayrollService(self.user).delete({'id': payroll.id})
                 self.assertFalse(self._deletion_tasks(payroll).exists())
 
+    @mock.patch.object(PayrollConfig, 'pre_approval_payroll_statuses', ['PENDING_VERIFICATION'])
     def test_a_payroll_not_yet_approved_is_put_up_for_deletion(self):
         for status in (PayrollStatus.PENDING_APPROVAL, 'PENDING_VERIFICATION',
                        PayrollStatus.GENERATING, PayrollStatus.FAILED):
@@ -669,6 +671,59 @@ class PayrollDeletionRequestTest(_RowsFixtures):
                 self._billed(BenefitConsumptionStatus.ACCEPTED, payroll)
                 PayrollService(self.user).delete({'id': payroll.id})
                 self.assertEqual(self._deletion_tasks(payroll).count(), 1)
+
+
+class PreApprovalStatusHookTest(_RowsFixtures):
+    """The statuses a deployment adds before PENDING_APPROVAL come from
+    PayrollConfig.pre_approval_payroll_statuses: a declared status counts as
+    not yet sent and still open, an undeclared one as neither."""
+
+    def _deletion_tasks(self, payroll):
+        from tasks_management.models import Task
+        return Task.objects.filter(entity_id=str(payroll.id),
+                                   business_event=PayrollConfig.payroll_delete_event)
+
+    def _request_benefit_deletion(self, benefit):
+        with mock.patch('payroll.services.TaskService'):
+            BenefitConsumptionService(self.user).delete({'id': benefit.id})
+        benefit.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.PENDING_DELETION)
+        return benefit
+
+    @mock.patch.object(PayrollConfig, 'pre_approval_payroll_statuses', ['PENDING_REVIEW'])
+    def test_a_declared_status_is_put_up_for_deletion_unchecked(self):
+        payroll = self._payroll('PENDING_REVIEW')
+        self._billed(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+        PayrollService(self.user).delete({'id': payroll.id})
+        self.assertEqual(self._deletion_tasks(payroll).count(), 1)
+
+    @mock.patch.object(PayrollConfig, 'pre_approval_payroll_statuses', [])
+    def test_an_undeclared_status_is_checked_before_deletion(self):
+        payroll = self._payroll('PENDING_VERIFICATION')
+        self._billed(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, payroll)
+        with self.assertRaises(ValueError):
+            PayrollService(self.user).delete({'id': payroll.id})
+        self.assertFalse(self._deletion_tasks(payroll).exists())
+
+    @mock.patch.object(PayrollConfig, 'pre_approval_payroll_statuses', ['PENDING_REVIEW'])
+    def test_a_payable_status_comes_back_in_a_declared_status(self):
+        payroll = self._payroll('PENDING_REVIEW')
+        benefit = self._request_benefit_deletion(
+            self._benefit(BenefitConsumptionStatus.ACCEPTED, payroll))
+        self.assertEqual(restore_benefit_after_refused_deletion(benefit, self.user),
+                         BenefitConsumptionStatus.ACCEPTED)
+        benefit.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.ACCEPTED)
+
+    @mock.patch.object(PayrollConfig, 'pre_approval_payroll_statuses', [])
+    def test_a_payable_status_stays_pending_deletion_in_an_undeclared_status(self):
+        payroll = self._payroll('PENDING_VERIFICATION')
+        benefit = self._request_benefit_deletion(
+            self._benefit(BenefitConsumptionStatus.ACCEPTED, payroll))
+        with self.assertLogs('payroll.services', level='ERROR'):
+            self.assertIsNone(restore_benefit_after_refused_deletion(benefit, self.user))
+        benefit.refresh_from_db()
+        self.assertEqual(benefit.status, BenefitConsumptionStatus.PENDING_DELETION)
 
 
 class OnlineSendResultTest(_Fixtures):

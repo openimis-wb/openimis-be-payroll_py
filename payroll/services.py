@@ -121,13 +121,14 @@ class PayrollService(BaseService):
     def update(self, obj_data):
         raise NotImplementedError()
 
-    # Statuses under which no agency has been asked to pay the payroll yet.
-    # PENDING_VERIFICATION is the verification step some deployments add
-    # before PENDING_APPROVAL.
-    STATUSES_DELETABLE_UNCHECKED = (
-        PayrollStatus.GENERATING, 'PENDING_VERIFICATION', PayrollStatus.PENDING_APPROVAL,
-        PayrollStatus.FAILED,
-    )
+    @staticmethod
+    def statuses_deletable_unchecked():
+        """Statuses under which no agency has been asked to pay the payroll yet,
+        the pre-approval statuses a deployment declares included."""
+        return (
+            PayrollStatus.GENERATING, *pre_approval_payroll_statuses(),
+            PayrollStatus.PENDING_APPROVAL, PayrollStatus.FAILED,
+        )
 
     @check_authentication
     @register_service_signal('payroll_service.delete')
@@ -137,7 +138,7 @@ class PayrollService(BaseService):
         A payroll already deleted, or one an agency may have paid from as a
         whole (its strategy's ``payroll_paid_reason``), is refused
         (ValueError). A payroll in any status but
-        ``STATUSES_DELETABLE_UNCHECKED`` is put up for deletion only when
+        ``statuses_deletable_unchecked()`` is put up for deletion only when
         none of its benefits may have been paid (its strategy's
         ``sent_benefit_reasons``); otherwise ValueError. The approved task
         checks again under lock (``delete_payroll``).
@@ -149,7 +150,7 @@ class PayrollService(BaseService):
         paid = strategy.payroll_paid_reason(payroll_to_delete)
         if paid:
             raise ValueError(f"Payroll {payroll_to_delete.id} is not deleted: {paid}.")
-        if payroll_to_delete.status not in self.STATUSES_DELETABLE_UNCHECKED:
+        if payroll_to_delete.status not in self.statuses_deletable_unchecked():
             sent = self._sent_benefit_reasons(payroll_to_delete, strategy)
             if sent:
                 raise ValueError(
@@ -536,13 +537,22 @@ PAYABLE_BENEFIT_STATUSES = (
     BenefitConsumptionStatus.CREATED,
     BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
 )
-# Payroll statuses before closure, the verification step a deployment may add
-# before approval included: a benefit in such a payroll can still be paid.
-OPEN_PAYROLL_STATUSES = (
-    'PENDING_VERIFICATION',
-    PayrollStatus.PENDING_APPROVAL,
-    PayrollStatus.APPROVE_FOR_PAYMENT,
-)
+
+
+def pre_approval_payroll_statuses():
+    """The statuses a deployment declares between generation and PENDING_APPROVAL
+    (PayrollConfig.pre_approval_payroll_statuses), read when called."""
+    return tuple(PayrollConfig.pre_approval_payroll_statuses or ())
+
+
+def open_payroll_statuses():
+    """Payroll statuses before closure, declared pre-approval statuses included:
+    a benefit in such a payroll can still be paid."""
+    return (
+        *pre_approval_payroll_statuses(),
+        PayrollStatus.PENDING_APPROVAL,
+        PayrollStatus.APPROVE_FOR_PAYMENT,
+    )
 
 
 def restore_benefit_after_refused_deletion(benefit, user):
@@ -556,7 +566,7 @@ def restore_benefit_after_refused_deletion(benefit, user):
 
     A status a payment path reads (ACCEPTED, CREATED, APPROVE_FOR_PAYMENT)
     comes back only while the benefit is in a live payroll not yet closed:
-    PENDING_VERIFICATION, PENDING_APPROVAL or APPROVE_FOR_PAYMENT. In a
+    a declared pre-approval status, PENDING_APPROVAL or APPROVE_FOR_PAYMENT. In a
     rejected, failed, reconciled or deleted payroll the benefit stays
     PENDING_DELETION, which no payment path reads. Returns the restored
     status, or None.
@@ -580,7 +590,7 @@ def restore_benefit_after_refused_deletion(benefit, user):
         return None
     if previous in PAYABLE_BENEFIT_STATUSES and not PayrollBenefitConsumption.objects.filter(
             benefit=benefit, is_deleted=False, payroll__is_deleted=False,
-            payroll__status__in=OPEN_PAYROLL_STATUSES,
+            payroll__status__in=open_payroll_statuses(),
     ).exists():
         logger.error(
             "Deletion of benefit %s refused; its payroll is closed, rejected, failed or deleted, "
