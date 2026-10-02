@@ -47,14 +47,16 @@ logger = logging.getLogger(__name__)
 MOVED_BENEFITS_REFUSAL = (
     "A payroll is not built from another payroll's benefits (from_failed_invoices_payroll_id): "
     "the moved benefits may already have been sent to the payment agency and would be paid "
-    "again. Pay benefits voided by a rejection again with recreate_payroll_benefits "
-    "--status-filter DUPLICATE."
+    "again. The payroll module configuration key move_benefits_from_failed_invoices_payroll "
+    "allows it."
 )
 
 
 def refuse_moved_benefits(creation_params):
-    """Raise when payroll creation parameters ask to move another payroll's benefits."""
-    if (creation_params or {}).get('from_failed_invoices_payroll_id'):
+    """Raise when payroll creation parameters ask to move another payroll's benefits
+    and PayrollConfig.move_benefits_from_failed_invoices_payroll is off."""
+    if ((creation_params or {}).get('from_failed_invoices_payroll_id')
+            and not PayrollConfig.move_benefits_from_failed_invoices_payroll):
         raise ValueError(MOVED_BENEFITS_REFUSAL)
 
 
@@ -203,7 +205,9 @@ class PayrollService(BaseService):
             refuse_moved_benefits(creation_params)
 
             # Clean up partial data from the failed attempt before retrying.
-            self._cleanup_payroll_benefits(payroll)
+            # A moved-benefits payroll holds benefits that predate it: they are kept.
+            if not creation_params.get('from_failed_invoices_payroll_id'):
+                self._cleanup_payroll_benefits(payroll)
 
             payroll.status = PayrollStatus.GENERATING
             if payroll.json_ext:
@@ -413,6 +417,16 @@ class PayrollService(BaseService):
             payment_cycle=payment_cycle
         )
 
+    @transaction.atomic
+    def _move_benefit_consumptions(self, payroll, from_payroll_id):
+        payroll_benefits = PayrollBenefitConsumption.objects.filter(
+            payroll_id=from_payroll_id,
+            benefit__status__in=[BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT]
+        )
+        payroll_benefits.update(payroll=payroll)
+        benefits = BenefitConsumption.objects.filter(payrollbenefitconsumption__payroll=payroll)
+        benefits.update(status=BenefitConsumptionStatus.ACCEPTED)
+
     _OPENSEARCH_SYNC_LOCK_ID = 0x4F53_5059
 
     def _create_payroll_benefits(self, payroll, obj_data):
@@ -430,19 +444,23 @@ class PayrollService(BaseService):
                 refuse_moved_benefits(obj_data)
                 if OpenSearchDashboard:
                     self._disable_opensearch_sync(dashboards_to_toggle)
+                from_failed_invoices_payroll_id = obj_data.pop("from_failed_invoices_payroll_id", None)
                 payment_plan = self._get_payment_plan(obj_data)
                 payment_cycle = self._get_payment_cycle(obj_data)
                 date_valid_from, date_valid_to = self._get_dates_parameter(obj_data)
 
-                beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
-                self._generate_benefits(
-                    payment_plan,
-                    beneficiaries_queryset,
-                    date_valid_from,
-                    date_valid_to,
-                    payroll,
-                    payment_cycle
-                )
+                if not bool(from_failed_invoices_payroll_id):
+                    beneficiaries_queryset = self._select_beneficiary_based_on_criteria(obj_data, payment_plan)
+                    self._generate_benefits(
+                        payment_plan,
+                        beneficiaries_queryset,
+                        date_valid_from,
+                        date_valid_to,
+                        payroll,
+                        payment_cycle
+                    )
+                else:
+                    self._move_benefit_consumptions(payroll, from_failed_invoices_payroll_id)
 
                 if payroll.status != PayrollStatus.PENDING_APPROVAL:
                     payroll.status = PayrollStatus.PENDING_APPROVAL

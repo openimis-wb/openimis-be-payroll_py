@@ -61,6 +61,10 @@ DEFAULT_CONFIG = {
     # such as a verification step. No agency has been asked to pay a payroll in
     # such a status, and it can still be approved.
     "pre_approval_payroll_statuses": [],
+    # Allow a payroll created with from_failed_invoices_payroll_id to take over the
+    # ACCEPTED and APPROVE_FOR_PAYMENT benefits of that payroll. A moved benefit an
+    # agency was already asked to pay is sent again once the new payroll is approved.
+    "move_benefits_from_failed_invoices_payroll": False,
 }
 
 
@@ -104,6 +108,7 @@ class PayrollConfig(AppConfig):
     benefit_code_pattern = None
     bulk_create_batch_size = None
     pre_approval_payroll_statuses = None
+    move_benefits_from_failed_invoices_payroll = None
     benefit_trigger_synced = False
 
     def ready(self):

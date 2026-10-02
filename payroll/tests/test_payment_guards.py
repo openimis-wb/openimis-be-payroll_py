@@ -5,7 +5,8 @@
   ACCEPTED.
 - A CSV reconciliation adds its columns to the benefit's json_ext and keeps
   the keys already there.
-- No payroll is built by moving another payroll's benefits into it.
+- No payroll is built by moving another payroll's benefits into it unless
+  the module configuration allows it.
 - Rejecting an approved payroll never takes back a payment: a benefit sent,
   reconciled or receipted keeps its status and receipt.
 - A benefit the gateway accepted whose save fails is logged at error level,
@@ -28,7 +29,7 @@ from django.test import SimpleTestCase, TestCase
 from core.signals import REGISTERED_SERVICE_SIGNALS
 from core.test_helpers import LogInHelper
 from individual.models import Individual
-from payroll.apps import PayrollConfig
+from payroll.apps import DEFAULT_CONFIG, PayrollConfig
 from payroll.models import (
     BenefitConsumption, BenefitConsumptionStatus, Payroll, PayrollBenefitConsumption,
     PayrollStatus,
@@ -274,7 +275,11 @@ class CsvReconciliationKeepsJsonExtTest(_Fixtures):
 
 class MovedBenefitsRefusedTest(_Fixtures):
     """A payroll built from another payroll's benefits would take benefits
-    already sent to the agency and send them again: every entry is refused."""
+    already sent to the agency and send them again: with the default module
+    configuration, every entry is refused."""
+
+    def test_moving_benefits_is_off_by_default(self):
+        self.assertIs(DEFAULT_CONFIG['move_benefits_from_failed_invoices_payroll'], False)
 
     def setUp(self):
         self.source = self._payroll(PayrollStatus.RECONCILED)
@@ -300,7 +305,7 @@ class MovedBenefitsRefusedTest(_Fixtures):
                 'from_failed_invoices_payroll_id': self.source.id,
             })
         self.assertFalse(result['success'])
-        self.assertIn('recreate_payroll_benefits', result['detail'])
+        self.assertIn('move_benefits_from_failed_invoices_payroll', result['detail'])
         task.delay.assert_not_called()
         self.assertFalse(Payroll.objects.filter(name='Retry').exists())
         self._assert_source_untouched()
@@ -320,7 +325,7 @@ class MovedBenefitsRefusedTest(_Fixtures):
         accept.assert_not_called()
         payroll.refresh_from_db()
         self.assertEqual(payroll.status, PayrollStatus.FAILED)
-        self.assertIn('recreate_payroll_benefits', payroll.json_ext['creation_error'])
+        self.assertIn('move_benefits_from_failed_invoices_payroll', payroll.json_ext['creation_error'])
         self._assert_source_untouched()
 
     def test_a_retrigger_of_a_payroll_built_from_another_is_refused(self):
@@ -331,11 +336,67 @@ class MovedBenefitsRefusedTest(_Fixtures):
                 mock.patch('payroll.services.create_payroll_benefits_task') as task:
             result = PayrollService(self.user).retrigger_creation({'id': payroll.id})
         self.assertFalse(result['success'])
-        self.assertIn('recreate_payroll_benefits', result['detail'])
+        self.assertIn('move_benefits_from_failed_invoices_payroll', result['detail'])
         task.delay.assert_not_called()
         payroll.refresh_from_db()
         self.assertEqual(payroll.status, PayrollStatus.FAILED)
         self._assert_source_untouched()
+
+
+@mock.patch.object(PayrollConfig, 'move_benefits_from_failed_invoices_payroll', True)
+class MovedBenefitsAllowedTest(_Fixtures):
+    """With move_benefits_from_failed_invoices_payroll on, a payroll created
+    from another one takes over its ACCEPTED and APPROVE_FOR_PAYMENT benefits
+    as ACCEPTED, and a regeneration keeps the benefits it took over."""
+
+    def setUp(self):
+        self.source = self._payroll(PayrollStatus.RECONCILED)
+        self.sent = self._benefit(BenefitConsumptionStatus.APPROVE_FOR_PAYMENT, self.source)
+        self.waiting = self._benefit(BenefitConsumptionStatus.ACCEPTED, self.source)
+        self.reconciled = self._benefit(BenefitConsumptionStatus.RECONCILED, self.source)
+
+    def _payroll_of(self, benefit):
+        return list(PayrollBenefitConsumption.objects.filter(benefit=benefit, is_deleted=False)
+                    .values_list('payroll_id', flat=True))
+
+    def test_creation_parameters_are_accepted(self):
+        from payroll.services import refuse_moved_benefits
+        refuse_moved_benefits({'from_failed_invoices_payroll_id': str(self.source.id)})
+
+    def test_generation_moves_the_accepted_and_approved_benefits(self):
+        payroll = self._payroll(PayrollStatus.GENERATING)
+        with mock.patch.object(PayrollService, '_get_payment_plan'), \
+                mock.patch.object(PayrollService, '_get_payment_cycle'), \
+                mock.patch.object(PayrollService, '_generate_benefits') as generate, \
+                mock.patch.object(PayrollService, 'create_accept_payroll_task') as accept:
+            PayrollService(self.user)._create_payroll_benefits(
+                payroll, {'from_failed_invoices_payroll_id': str(self.source.id)})
+        generate.assert_not_called()
+        accept.assert_called_once()
+        for benefit in (self.sent, self.waiting):
+            benefit.refresh_from_db()
+            self.assertEqual(benefit.status, BenefitConsumptionStatus.ACCEPTED)
+            self.assertEqual(self._payroll_of(benefit), [payroll.id])
+        self.reconciled.refresh_from_db()
+        self.assertEqual(self.reconciled.status, BenefitConsumptionStatus.RECONCILED)
+        self.assertEqual(self._payroll_of(self.reconciled), [self.source.id])
+        payroll.refresh_from_db()
+        self.assertEqual(payroll.status, PayrollStatus.PENDING_APPROVAL)
+
+    def test_a_retrigger_keeps_the_benefits_it_took_over(self):
+        payroll = self._payroll(PayrollStatus.FAILED)
+        PayrollBenefitConsumption.objects.filter(benefit=self.waiting).update(payroll=payroll)
+        Payroll.objects.filter(id=payroll.id).update(json_ext={'creation_params': {
+            'name': 'Retry', 'from_failed_invoices_payroll_id': str(self.source.id)}})
+        with _without_other_modules('payroll_service.retrigger_creation'), \
+                mock.patch('payroll.services.create_payroll_benefits_task') as task:
+            result = PayrollService(self.user).retrigger_creation({'id': payroll.id})
+        self.assertNotIn('success', result, result)
+        task.delay.assert_called_once()
+        payroll.refresh_from_db()
+        self.assertEqual(payroll.status, PayrollStatus.GENERATING)
+        self.assertTrue(BenefitConsumption.objects.filter(id=self.waiting.id).exists())
+        self.assertEqual(self._payroll_of(self.waiting), [payroll.id])
 
 
 class RejectApprovedPayrollTest(_Fixtures):
