@@ -690,6 +690,7 @@ class CsvReconciliationService:
 
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
+        self._check_approved_for_payment(payroll)
         bc_qs = self._get_benefit_consumption_qs(payroll)
         # Retrieve the basic fields
         field_keys = list(PayrollConfig.csv_reconciliation_field_mapping.keys())
@@ -729,6 +730,7 @@ class CsvReconciliationService:
 
     def upload_reconciliation(self, payroll_id, file, upload):
         payroll = self._resolve_payroll(payroll_id)
+        self._check_approved_for_payment(payroll)
         upload.payroll = payroll
         upload.status = upload.Status.IN_PROGRESS
         upload.save(username=self.user.login_name)
@@ -798,6 +800,13 @@ class CsvReconciliationService:
         if not payroll:
             raise ValueError('csv_reconciliation.validation.payroll_not_found')
         return payroll
+
+    @staticmethod
+    def _check_approved_for_payment(payroll):
+        """The reconciliation sheet lists what an agency pays and records what
+        it paid: only an APPROVE_FOR_PAYMENT payroll is read or written."""
+        if payroll.status != PayrollStatus.APPROVE_FOR_PAYMENT:
+            raise ValueError('csv_reconciliation.validation.payroll_not_approved_for_payment')
 
     def _reconcile_row(self, payroll, row):
         errors = []
